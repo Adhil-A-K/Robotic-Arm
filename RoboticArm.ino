@@ -104,10 +104,10 @@ struct Preset {
 //       gripper closes/opens during pick/drop — handled by the sequence).
 //       The Gripper value here is the "approach" gripper state (open = 0).
 Preset presets[4] = {
-  { "pickup1", "Pickup 1",  { 45,  130,  60,  90,  GRIPPER_OPEN } },
-  { "pickup2", "Pickup 2",  { 135, 130,  60,  90,  GRIPPER_OPEN } },
-  { "drop1",   "Drop 1",    { 45,  100,  80,  90,  GRIPPER_OPEN } },
-  { "drop2",   "Drop 2",    { 135, 100,  80,  90,  GRIPPER_OPEN } },
+  { "pickup1", "Paper — Pickup",   { 45,  130,  60,  90,  GRIPPER_OPEN } },
+  { "pickup2", "Plastic — Pickup", { 135, 130,  60,  90,  GRIPPER_OPEN } },
+  { "drop1",   "Paper — Drop",     { 45,  100,  80,  90,  GRIPPER_OPEN } },
+  { "drop2",   "Plastic — Drop",   { 135, 100,  80,  90,  GRIPPER_OPEN } },
 };
 
 // Safe transit height (arm raised safely before moving between positions)
@@ -704,14 +704,14 @@ const char HTML_PAGE[] PROGMEM = R"=====(
   <div class="pd-sub">Arm moves to pickup → grabs → transits → drops into basket. Uses preset positions below.</div>
   <div class="pd-buttons">
     <button class="pd-btn pd-obj1" id="btnObj1" onclick="runPickDrop(0)">
-      <span class="pd-icon">📦</span>
-      <span>Pick &amp; Drop Object 1</span>
-      <span class="pd-label">Pickup 1 → Drop 1</span>
+      <span class="pd-icon">📄</span>
+      <span>Pick &amp; Drop Paper</span>
+      <span class="pd-label">Paper Pickup → Paper Drop</span>
     </button>
     <button class="pd-btn pd-obj2" id="btnObj2" onclick="runPickDrop(1)">
-      <span class="pd-icon">📦</span>
-      <span>Pick &amp; Drop Object 2</span>
-      <span class="pd-label">Pickup 2 → Drop 2</span>
+      <span class="pd-icon">🧴</span>
+      <span>Pick &amp; Drop Plastic</span>
+      <span class="pd-label">Plastic Pickup → Plastic Drop</span>
     </button>
     <button class="pd-btn pd-stop" id="btnStop" onclick="stopSeq()">
       <span class="pd-icon">🛑</span>
@@ -864,7 +864,7 @@ function runPickDrop(obj) {
     .then(t => {
       if (t === 'OK') {
         setSeqRunning(true);
-        showToast(`Sequence started: Object ${obj + 1}`);
+        showToast(`Sequence started: ${obj === 0 ? 'Paper' : 'Plastic'}`);
       } else {
         showToast('⚠ ' + t, true);
       }
@@ -1096,7 +1096,7 @@ void setup() {
         seqObj     = obj;
         seqStep    = 0;
         seqRunning = true;
-        Serial.printf("[SEQ] Starting pick-and-drop for object %d\n", obj + 1);
+        Serial.printf("[SEQ] Starting pick-and-drop for: %s\n", obj == 0 ? "Paper" : "Plastic");
         req->send(200, "text/plain", "OK");
         return;
       }
