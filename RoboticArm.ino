@@ -64,11 +64,12 @@ struct ServoConfig {
 };
 
 ServoConfig servos[NUM_SERVOS] = {
+  //   name         icon   subtitle               ch           min  max  home
   { "Base",     "🔄", "Rotation / Yaw",      CH_BASE,       0, 180,  90 },
-  { "Shoulder", "💪", "Joint 1 / Lift",      CH_SHOULDER,   0, 180,  90 },
-  { "Elbow",    "🦾", "Joint 2 / Reach",     CH_ELBOW,      0, 180,  90 },
-  { "Wrist",    "🤚", "Joint 3 / Tilt",      CH_WRIST,      0, 180,  90 },
-  { "Gripper",  "✊", "End Effector",        CH_GRIPPER,    0,  90,  45 },
+  { "Shoulder", "💪", "Joint 1 / Lift",      CH_SHOULDER,   0, 180, 180 },
+  { "Elbow",    "🦾", "Joint 2 / Reach",     CH_ELBOW,      0, 180,   0 },
+  { "Wrist",    "🤚", "Joint 3 / Tilt",      CH_WRIST,     30, 180,  90 },
+  { "Gripper",  "✊", "End Effector",        CH_GRIPPER,    0,  90,  30 },
 };
 
 // ── Startup Target Angles ─────────────────────────────────────
@@ -81,7 +82,7 @@ int startupAngles[NUM_SERVOS] = { 90, 180, 0, 90, 30 };
 
 // ── Gripper open/close angles ─────────────────────────────────
 #define GRIPPER_OPEN    0    // fully open
-#define GRIPPER_CLOSE   85   // fully closed (gripping)
+#define GRIPPER_CLOSE   90   // fully closed (gripping)
 
 // ╔══════════════════════════════════════════════════════════════╗
 // ║                  PRESET LOCATIONS                           ║
@@ -343,6 +344,34 @@ String buildConfigJson() {
     if (p < 3) json += ",";
   }
   json += "],\"seqRunning\":" + String(seqRunning ? "true" : "false") + "}";
+  return json;
+}
+
+// Lightweight status — polled every 500ms by the dashboard.
+// Returns live angles + busy flag + status text.
+String buildStatusJson() {
+  const char* stepLabels[] = {
+    "Raising to transit height",
+    "Moving to pickup",
+    "Closing gripper",
+    "Gripping...",
+    "Transiting with object",
+    "Moving to drop",
+    "Opening gripper",
+    "Releasing...",
+    "Returning to transit",
+    "Done"
+  };
+  String label = seqRunning ? String(stepLabels[seqStep]) : "Idle";
+  String json = "{";
+  json += "\"busy\":"   + String(seqRunning ? "true" : "false") + ",";
+  json += "\"task\":\""  + label + "\",";
+  json += "\"angles\":[";
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    json += String(currentAngles[i]);
+    if (i < NUM_SERVOS - 1) json += ",";
+  }
+  json += "]}";
   return json;
 }
 
@@ -729,6 +758,8 @@ fetch('/config')
     buildServoUI();
     buildPresetUI();
     if (data.seqRunning) setSeqRunning(true);
+    // Always poll /status so sliders stay live even when idle
+    if (!seqPoll) seqPoll = setInterval(pollSeqStatus, 500);
   })
   .catch(() => {
     document.getElementById('loading').textContent = '⚠ Failed to load config';
@@ -865,10 +896,19 @@ function setSeqRunning(running) {
 }
 
 function pollSeqStatus() {
-  fetch('/config')
+  fetch('/status')
     .then(r => r.json())
-    .then(data => {
-      if (!data.seqRunning) setSeqRunning(false);
+    .then(s => {
+      if (!s.busy) setSeqRunning(false);
+      document.getElementById('seqStatus').textContent =
+        s.busy ? ('▶ ' + s.task) : 'IDLE — Ready';
+      // Update slider displays from live angles (don't interrupt active drags)
+      s.angles.forEach((a, i) => {
+        const sl = document.getElementById('sl' + i);
+        const dp = document.getElementById('disp' + i);
+        if (sl && !sl.matches(':active')) { sl.value = a; joints[i].val = a; }
+        if (dp && !sl.matches(':active')) { dp.textContent = a + '°'; }
+      });
     })
     .catch(() => {});
 }
@@ -969,6 +1009,11 @@ void setup() {
 
   server.on("/config", HTTP_GET, [](AsyncWebServerRequest* req) {
     req->send(200, "application/json", buildConfigJson());
+  });
+
+  // /status — lightweight poll: live angles + busy + step label
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send(200, "application/json", buildStatusJson());
   });
 
   server.on("/set", HTTP_GET, [](AsyncWebServerRequest* req) {
