@@ -84,6 +84,11 @@ int startupAngles[NUM_SERVOS] = { 90, 180, 0, 90, 30 };
 #define GRIPPER_OPEN    0    // fully open
 #define GRIPPER_CLOSE   90   // fully closed (gripping)
 
+// ── Sequence timing (for more natural movement) ───────────────
+#define SEQ_GRIP_SETTLE_MS       900
+#define SEQ_RELEASE_SETTLE_MS    700
+#define SEQ_REARM_DELAY_MS      1200   // ignore new app detections briefly after completion
+
 // ╔══════════════════════════════════════════════════════════════╗
 // ║                  PRESET LOCATIONS                           ║
 // ║                                                             ║
@@ -121,9 +126,16 @@ unsigned long lastStepMs = 0;
 // Sequence state machine
 bool        seqRunning  = false;
 int         seqStep     = 0;
-int         seqObj      = 0;   // 0 = object1, 1 = object2
+int         seqObj      = 0;   // 0 = Paper, 1 = Plastic
 bool        seqWaiting  = false;
 unsigned long seqWaitUntil = 0;
+
+// App-triggered detection gating
+unsigned long rearmAfterMs = 0;      // ignore /update triggers until this timestamp
+int lastDetectedType = -1;           // -1 none, 0 paper, 1 plastic
+String lastDetectedName = "None";
+unsigned long lastDetectedAtMs = 0;
+String lastUpdateSource = "none";    // "manual" or "app"
 
 // Sequence steps enum
 enum SeqStep {
@@ -233,6 +245,68 @@ void moveAllHome() {
   for (int i = 0; i < NUM_SERVOS; i++) setServoAngle(i, servos[i].homeAngle);
 }
 
+const char* objectName(int obj) {
+  return (obj == 0) ? "Paper" : "Plastic";
+}
+
+void startSequence(int obj, const char* source) {
+  seqObj = obj;
+  seqStep = 0;
+  seqRunning = true;
+  seqWaiting = false;
+  seqWaitUntil = 0;
+
+  lastDetectedType = obj;
+  lastDetectedName = objectName(obj);
+  lastDetectedAtMs = millis();
+  lastUpdateSource = source;
+
+  Serial.printf("[SEQ] Starting pick-and-drop for: %s (source=%s)\n", objectName(obj), source);
+}
+
+// Returns: 0=paper, 1=plastic, -1=unknown/invalid
+int resolveObjFromUpdatePayload(const String& body) {
+  // Text fallback first (handles raw payloads like "0", "1", "paper", "plastic")
+  String raw = body;
+  raw.trim();
+  String rawLower = raw;
+  rawLower.toLowerCase();
+  if (rawLower == "0" || rawLower == "paper")   return 0;
+  if (rawLower == "1" || rawLower == "plastic") return 1;
+  if (rawLower == "metal") return 0; // compatibility alias
+
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("[/update] JSON parse error: %s\n", err.c_str());
+    // Last-chance fuzzy parse from raw text
+    if (rawLower.indexOf("paper") >= 0 || rawLower.indexOf("metal") >= 0) return 0;
+    if (rawLower.indexOf("plastic") >= 0) return 1;
+    return -1;
+  }
+
+  // Primary format (as in sample): {"bin_type":0|1}
+  if (doc.containsKey("bin_type")) {
+    int t = doc["bin_type"].as<int>();
+    if (t == 0 || t == 1) return t;
+    return -1;
+  }
+
+  // Flexible fallback fields while app side is still evolving
+  const char* keys[] = { "status", "type", "label", "material", "waste_type", "bin_name", "class" };
+  for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+    if (doc.containsKey(keys[i])) {
+      String s = doc[keys[i]].as<String>();
+      s.toLowerCase();
+      if (s.indexOf("paper") >= 0)   return 0;
+      if (s.indexOf("plastic") >= 0) return 1;
+      if (s.indexOf("metal") >= 0)   return 0; // compatibility alias
+    }
+  }
+
+  return -1;
+}
+
 // ── Pick-and-Drop Sequence State Machine ──────────────────────
 // Called from loop() — non-blocking step execution.
 void runSequence() {
@@ -270,7 +344,7 @@ void runSequence() {
       Serial.printf("[SEQ] Step 3 — Close gripper\n");
       setServoAngle(CH_GRIPPER, GRIPPER_CLOSE);
       seqWaiting   = true;
-      seqWaitUntil = millis() + 600;   // 600ms settle
+      seqWaitUntil = millis() + SEQ_GRIP_SETTLE_MS;
       break;
 
     case SEQ_WAIT_GRIP:
@@ -296,7 +370,7 @@ void runSequence() {
       Serial.printf("[SEQ] Step 6 — Open gripper (drop object)\n");
       setServoAngle(CH_GRIPPER, GRIPPER_OPEN);
       seqWaiting   = true;
-      seqWaitUntil = millis() + 500;
+      seqWaitUntil = millis() + SEQ_RELEASE_SETTLE_MS;
       break;
 
     case SEQ_WAIT_RELEASE:
@@ -310,9 +384,11 @@ void runSequence() {
       break;
 
     case SEQ_DONE:
-      Serial.printf("[SEQ] Done — Object %d delivered.\n", seqObj + 1);
+      Serial.printf("[SEQ] Done — %s delivered.\n", objectName(seqObj));
       seqRunning = false;
       seqStep    = 0;
+      // Start short re-arm delay to ignore duplicate app spam right after drop
+      rearmAfterMs = millis() + SEQ_REARM_DELAY_MS;
       break;
   }
 }
@@ -365,8 +441,16 @@ String buildStatusJson() {
   String label = seqRunning ? String(stepLabels[seqStep]) : "Idle";
   String json = "{";
   json += "\"busy\":"   + String(seqRunning ? "true" : "false") + ",";
+  json += "\"status\":\"" + String(seqRunning ? "RUNNING" : "IDLE") + "\",";
   json += "\"task\":\""  + label + "\",";
-  json += "\"angles\":[";
+  json += "\"last_detected_type\":" + String(lastDetectedType) + ",
+  json += "\"last_detected_name\":\"" + lastDetectedName + "\",";
+  json += "\"last_source\":\"" + lastUpdateSource + "\",";
+  json += "\"uptime_s\":" + String(millis() / 1000) + ",";
+  long rearmInMs = (long)rearmAfterMs - (long)millis();
+  if (rearmInMs < 0) rearmInMs = 0;
+  json += "\"rearm_in_ms\":" + String(rearmInMs) + ",";
+  json += "\"angles\":[
   for (int i = 0; i < NUM_SERVOS; i++) {
     json += String(currentAngles[i]);
     if (i < NUM_SERVOS - 1) json += ",";
@@ -887,11 +971,9 @@ function setSeqRunning(running) {
   if (running) {
     status.textContent = '▶ RUNNING — Sequence in progress...';
     status.className = 'seq-status running';
-    if (!seqPoll) seqPoll = setInterval(pollSeqStatus, 800);
   } else {
     status.textContent = 'IDLE — Ready';
     status.className = 'seq-status';
-    if (seqPoll) { clearInterval(seqPoll); seqPoll = null; }
   }
 }
 
@@ -1016,6 +1098,76 @@ void setup() {
     req->send(200, "application/json", buildStatusJson());
   });
 
+  // /ping — app-side health check
+  server.on("/ping", HTTP_GET, [](AsyncWebServerRequest* req) {
+    String json = "{";
+    json += "\"status\":\"pong\",";
+    json += "\"device\":\"RoboticArm_ESP32\",";
+    json += "\"busy\":" + String(seqRunning ? "true" : "false") + ",";
+    json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+    json += "\"uptime_s\":" + String(millis() / 1000);
+    json += "}";
+    req->send(200, "application/json", json);
+  });
+
+  // /update (POST JSON) — trigger sequence from app detection
+  // Accepts:
+  //   {"bin_type":0}   => paper
+  //   {"bin_type":1}   => plastic
+  // Also accepts fallback string fields like status/type/label/material.
+  server.on("/update", HTTP_POST,
+    [](AsyncWebServerRequest* req) {
+      if (req->contentLength() == 0) {
+        req->send(400, "application/json", "{\"error\":\"Missing request body\"}");
+      }
+    },
+    NULL,
+    [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index, size_t total) {
+      if (index == 0) {
+        req->_tempObject = new String();
+        ((String*)req->_tempObject)->reserve(total);
+      }
+
+      String* body = (String*)req->_tempObject;
+      body->concat((const char*)data, len);
+
+      if (index + len != total) return; // wait for full payload
+
+      String payload = *body;
+      delete body;
+      req->_tempObject = nullptr;
+
+      // Ignore duplicate app messages while sequence is active or in short re-arm window
+      if (seqRunning) {
+        req->send(200, "application/json",
+          "{\"accepted\":false,\"ignored\":true,\"reason\":\"busy\"}");
+        return;
+      }
+
+      if (millis() < rearmAfterMs) {
+        req->send(200, "application/json",
+          "{\"accepted\":false,\"ignored\":true,\"reason\":\"rearming\"}");
+        return;
+      }
+
+      int obj = resolveObjFromUpdatePayload(payload);
+      if (obj < 0) {
+        req->send(400, "application/json",
+          "{\"error\":\"Invalid payload. Use {bin_type:0|1} or include paper/plastic label\"}");
+        return;
+      }
+
+      startSequence(obj, "app");
+
+      String json = "{";
+      json += "\"accepted\":true,";
+      json += "\"queued\":\"" + String(objectName(obj)) + "\",";
+      json += "\"busy\":true";
+      json += "}";
+      req->send(200, "application/json", json);
+    }
+  );
+
   server.on("/set", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (req->hasParam("ch") && req->hasParam("angle")) {
       int ch    = req->getParam("ch")->value().toInt();
@@ -1084,7 +1236,7 @@ void setup() {
     req->send(400, "text/plain", "Bad Request");
   });
 
-  // /pickdrop?obj=0  (0 = object1, 1 = object2)
+  // /pickdrop?obj=0  (0 = paper, 1 = plastic)
   server.on("/pickdrop", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (seqRunning) {
       req->send(200, "text/plain", "Already running");
@@ -1093,10 +1245,7 @@ void setup() {
     if (req->hasParam("obj")) {
       int obj = req->getParam("obj")->value().toInt();
       if (obj == 0 || obj == 1) {
-        seqObj     = obj;
-        seqStep    = 0;
-        seqRunning = true;
-        Serial.printf("[SEQ] Starting pick-and-drop for: %s\n", obj == 0 ? "Paper" : "Plastic");
+        startSequence(obj, "manual");
         req->send(200, "text/plain", "OK");
         return;
       }
@@ -1108,6 +1257,8 @@ void setup() {
   server.on("/stop_seq", HTTP_GET, [](AsyncWebServerRequest* req) {
     seqRunning = false;
     seqStep    = 0;
+    seqWaiting = false;
+    rearmAfterMs = 0; // allow immediate next command after manual stop
     // Halt all servos at current position
     for (int i = 0; i < NUM_SERVOS; i++) targetAngles[i] = currentAngles[i];
     Serial.println("[SEQ] STOPPED by user");
