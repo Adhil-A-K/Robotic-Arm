@@ -47,6 +47,16 @@ static const IPAddress AP_LOCAL_IP(192, 168, 4, 1);
 static const IPAddress AP_GATEWAY(192, 168, 4, 1);
 static const IPAddress AP_SUBNET(255, 255, 255, 0);
 
+// ── Boot movement mitigation (optional hardware assist) ──────
+// If you wire PCA9685 OE pin to an ESP32 GPIO, boot twitch can be minimized:
+// - Keep outputs disabled during init
+// - Program startup angles
+// - Then enable outputs
+// PCA9685 OE is ACTIVE-HIGH (HIGH=disabled, LOW=enabled).
+// Set to -1 if OE is not wired.
+static const int PCA_OE_PIN = 25;
+#define PCA_OUTPUT_ENABLE_DELAY_MS  80
+
 // ── PCA9685 ───────────────────────────────────────────────────
 Adafruit_PWMServoDriver pca = Adafruit_PWMServoDriver(0x40);
 
@@ -76,19 +86,18 @@ struct ServoConfig {
 
 ServoConfig servos[NUM_SERVOS] = {
   //   name         icon   subtitle               ch           min  max  home
-  { "Base",     "🔄", "Rotation / Yaw",      CH_BASE,       0, 180,  90 },
+  { "Base",     "🔄", "Rotation / Yaw",      CH_BASE,       0, 180,  94 },
   { "Shoulder", "💪", "Joint 1 / Lift",      CH_SHOULDER,   0, 180, 180 },
   { "Elbow",    "🦾", "Joint 2 / Reach",     CH_ELBOW,      0, 180,   0 },
-  { "Wrist",    "🤚", "Joint 3 / Tilt",      CH_WRIST,     30, 180,  90 },
+  { "Wrist",    "🤚", "Joint 3 / Tilt",      CH_WRIST,     30, 180,  55 },
   { "Gripper",  "✊", "End Effector",        CH_GRIPPER,    0,  90,  30 },
 };
 
 // ── Startup Target Angles ─────────────────────────────────────
 //                   Base  Shoulder  Elbow  Wrist  Gripper
-int startupAngles[NUM_SERVOS] = { 90, 180, 0, 90, 30 };
+int startupAngles[NUM_SERVOS] = { 94, 180, 0, 55, 30 };
 
 // ── Speed Settings ────────────────────────────────────────────
-#define SERVO_SPEED_STARTUP  30   // °/s  startup sweep
 #define SERVO_SPEED          60   // °/s  runtime
 
 // ── Gripper open/close angles ─────────────────────────────────
@@ -120,10 +129,10 @@ struct Preset {
 //       gripper closes/opens during pick/drop — handled by the sequence).
 //       The Gripper value here is the "approach" gripper state (open = 0).
 Preset presets[4] = {
-  { "pickup1", "Paper — Pickup",   { 45,  130,  60,  90,  GRIPPER_OPEN } },
-  { "pickup2", "Plastic — Pickup", { 135, 130,  60,  90,  GRIPPER_OPEN } },
-  { "drop1",   "Paper — Drop",     { 45,  100,  80,  90,  GRIPPER_OPEN } },
-  { "drop2",   "Plastic — Drop",   { 135, 100,  80,  90,  GRIPPER_OPEN } },
+  { "pickup1", "Paper — Pickup",   {  99,  93,  16, 126, GRIPPER_OPEN } },
+  { "pickup2", "Plastic — Pickup", {  99,  93,  16, 126, GRIPPER_OPEN } },
+  { "drop1",   "Paper — Drop",     {  69, 115, 180, 169, GRIPPER_OPEN } },
+  { "drop2",   "Plastic — Drop",   { 125, 115, 180, 169, GRIPPER_OPEN } },
 };
 
 // Safe transit height (arm raised safely before moving between positions)
@@ -183,6 +192,12 @@ void writeServoNow(int ch, int angle) {
   uint16_t tick = angleToPwm(angle, servos[ch].minAngle, servos[ch].maxAngle);
   pca.setPWM(servos[ch].channel, 0, tick);
   currentAngles[ch] = angle;
+}
+
+void setPcaOutputsEnabled(bool enable) {
+  if (PCA_OE_PIN < 0) return;
+  // OE active-high: HIGH disables outputs, LOW enables outputs.
+  digitalWrite(PCA_OE_PIN, enable ? LOW : HIGH);
 }
 
 void setServoAngle(int ch, int angle) {
@@ -1079,14 +1094,20 @@ function showToast(msg, isErr = false) {
 void setup() {
   Serial.begin(115200);
 
+  // Optional: keep PWM outputs disabled during boot init to reduce startup twitch.
+  if (PCA_OE_PIN >= 0) {
+    pinMode(PCA_OE_PIN, OUTPUT);
+    setPcaOutputsEnabled(false); // disable outputs (OE HIGH)
+    Serial.printf("[INIT] PCA outputs disabled on OE pin GPIO %d\n", PCA_OE_PIN);
+  }
+
   pca.begin();
   pca.setOscillatorFrequency(OSC_FREQ);
   pca.setPWMFreq(PWM_FREQ_HZ);
   delay(10);
 
   // IMPORTANT:
-  // Do NOT force servos to 0° on boot. That caused shoulder dip (180° -> 0° -> 180°).
-  // Instead, sync directly to startup angles on power-up.
+  // Do NOT force servos to 0° on boot. Sync directly to startup angles.
   Serial.println("\n[INIT] Syncing servos directly to startup angles...");
   for (int i = 0; i < NUM_SERVOS; i++) {
     int a = clampAngle(i, startupAngles[i]);
@@ -1094,6 +1115,14 @@ void setup() {
     targetAngles[i] = a;
   }
   delay(120);
+
+  // Re-enable PWM outputs only after valid targets are already loaded.
+  if (PCA_OE_PIN >= 0) {
+    delay(PCA_OUTPUT_ENABLE_DELAY_MS);
+    setPcaOutputsEnabled(true); // enable outputs (OE LOW)
+    Serial.println("[INIT] PCA outputs enabled.");
+  }
+
   Serial.println("[INIT] Ready.");
 
   // Network init (friend-style): AP always ON + optional STA

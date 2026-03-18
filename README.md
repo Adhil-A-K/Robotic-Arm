@@ -38,20 +38,19 @@ This prevents double-pick for one object.
 ```cpp
 ServoConfig servos[NUM_SERVOS] = {
   //   name         icon   subtitle               ch           min  max  home
-  { "Base",     "🔄", "Rotation / Yaw",      CH_BASE,       0, 180,  90 },
+  { "Base",     "🔄", "Rotation / Yaw",      CH_BASE,       0, 180,  94 },
   { "Shoulder", "💪", "Joint 1 / Lift",      CH_SHOULDER,   0, 180, 180 },
   { "Elbow",    "🦾", "Joint 2 / Reach",     CH_ELBOW,      0, 180,   0 },
-  { "Wrist",    "🤚", "Joint 3 / Tilt",      CH_WRIST,     30, 180,  90 },
+  { "Wrist",    "🤚", "Joint 3 / Tilt",      CH_WRIST,     30, 180,  55 },
   { "Gripper",  "✊", "End Effector",        CH_GRIPPER,    0,  90,  30 },
 };
 
-int startupAngles[NUM_SERVOS] = { 90, 180, 0, 90, 30 };
+int startupAngles[NUM_SERVOS] = { 94, 180, 0, 55, 30 };
 ```
 
 ### Important tuning constants
 ```cpp
-#define SERVO_SPEED_STARTUP   30   // boot sweep speed
-#define SERVO_SPEED           60   // runtime speed
+#define SERVO_SPEED           60   // runtime smooth speed
 
 #define GRIPPER_OPEN           0
 #define GRIPPER_CLOSE         90
@@ -59,6 +58,10 @@ int startupAngles[NUM_SERVOS] = { 90, 180, 0, 90, 30 };
 #define SEQ_GRIP_SETTLE_MS   900
 #define SEQ_RELEASE_SETTLE_MS 700
 #define SEQ_REARM_DELAY_MS  1200
+
+// Optional startup twitch mitigation (requires wiring OE pin)
+static const int PCA_OE_PIN = 25;          // chosen free GPIO for OE control
+#define PCA_OUTPUT_ENABLE_DELAY_MS 80
 ```
 
 ---
@@ -68,10 +71,10 @@ int startupAngles[NUM_SERVOS] = { 90, 180, 0, 90, 30 };
 Current placeholders:
 ```cpp
 Preset presets[4] = {
-  { "pickup1", "Paper — Pickup",   { 45, 130,  60,  90, 0 } },
-  { "pickup2", "Plastic — Pickup", {135, 130,  60,  90, 0 } },
-  { "drop1",   "Paper — Drop",     { 45, 100,  80,  90, 0 } },
-  { "drop2",   "Plastic — Drop",   {135, 100,  80,  90, 0 } },
+  { "pickup1", "Paper — Pickup",   { 99,  93,  16, 126, 0 } },
+  { "pickup2", "Plastic — Pickup", { 99,  93,  16, 126, 0 } },
+  { "drop1",   "Paper — Drop",     { 69, 115, 180, 169, 0 } },
+  { "drop2",   "Plastic — Drop",   {125, 115, 180, 169, 0 } },
 };
 
 int transitAngles[NUM_SERVOS] = { 90, 160, 20, 90, 0 };
@@ -83,6 +86,31 @@ int transitAngles[NUM_SERVOS] = { 90, 160, 20, 90, 0 };
 3. Click **Save Current** for each preset
 4. Test via manual Pick & Drop buttons
 5. When stable, copy values into firmware `presets[]` and flash
+
+---
+
+## Startup unwanted movement (0° twitch)
+
+If servos briefly move on ESP32 boot before returning to home, this is usually a **startup signal transient**, not pick/drop logic.
+
+### Why it happens
+- ESP32 resets faster than the servo control path stabilizes
+- PCA9685 outputs can be in a transient/disabled state during early boot
+- Servos may react before valid target pulses are fully applied
+
+### Mitigation implemented in firmware
+- Startup now directly writes `startupAngles[]` (no intentional 0° sweep)
+- Optional OE-based output gating is supported:
+  1. Keep outputs disabled during init
+  2. Program startup angles
+  3. Enable outputs after a short delay
+
+### To fully suppress boot twitch (recommended)
+1. Wire **PCA9685 OE** pin to a free ESP32 GPIO
+2. Set `PCA_OE_PIN` to that GPIO in firmware
+3. (Best practice) Add a pull-up on OE so outputs stay disabled during reset
+
+> Note: “just adding a delay before PCA init” usually does **not** solve twitch by itself.
 
 ---
 
