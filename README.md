@@ -88,9 +88,19 @@ int transitAngles[NUM_SERVOS] = { 90, 160, 20, 90, 0 };
 
 ## Network + API
 
-ESP32 is currently STA mode in this firmware (joins Wi-Fi):
-- SSID: from `WIFI_SSID`
-- Password: from `WIFI_PASS`
+ESP32 now uses **friend-style AP + optional STA dual mode**:
+
+- **AP always ON** (stable app fallback)
+  - SSID: `WasteBin_AP`
+  - Password: `12345678`
+  - IP: `192.168.4.1` (fixed)
+- **STA optional** (`ENABLE_STA=true` by default)
+  - Router SSID: `Motridox`
+  - Router Password: `Bassim@8371`
+
+So your friend can either:
+1. Connect phone directly to ESP AP (`192.168.4.1`), or
+2. Use router path when STA is connected.
 
 ### Endpoints
 - `GET /` → Web dashboard
@@ -128,7 +138,8 @@ or
 
 ## Quick test commands
 
-Replace `<ESP_IP>` with your device IP.
+For direct AP mode, use `192.168.4.1`.
+(If using router STA mode, replace `<ESP_IP>` with router-assigned ESP IP.)
 
 ### Ping
 ```bash

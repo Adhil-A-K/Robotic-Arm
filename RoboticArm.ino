@@ -32,9 +32,20 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 
-// ── WiFi Credentials ─────────────────────────────────────────
-const char* WIFI_SSID = "Motridox";
-const char* WIFI_PASS = "Bassim@8371";
+// ── Network Mode (friend-style AP + optional STA) ───────────
+// AP is always ON so the app has a stable fallback endpoint.
+static const char *AP_SSID     = "WasteBin_AP";
+static const char *AP_PASSWORD = "12345678";
+
+// Optional: also connect ESP32 to router while AP stays active.
+static const bool   ENABLE_STA   = true;
+static const char *STA_SSID      = "Motridox";
+static const char *STA_PASSWORD  = "Bassim@8371";
+
+// Fixed AP IP (stable for app): http://192.168.4.1
+static const IPAddress AP_LOCAL_IP(192, 168, 4, 1);
+static const IPAddress AP_GATEWAY(192, 168, 4, 1);
+static const IPAddress AP_SUBNET(255, 255, 255, 0);
 
 // ── PCA9685 ───────────────────────────────────────────────────
 Adafruit_PWMServoDriver pca = Adafruit_PWMServoDriver(0x40);
@@ -438,19 +449,26 @@ String buildStatusJson() {
     "Returning to transit",
     "Done"
   };
+
   String label = seqRunning ? String(stepLabels[seqStep]) : "Idle";
   String json = "{";
-  json += "\"busy\":"   + String(seqRunning ? "true" : "false") + ",";
+  json += "\"busy\":" + String(seqRunning ? "true" : "false") + ",";
   json += "\"status\":\"" + String(seqRunning ? "RUNNING" : "IDLE") + "\",";
-  json += "\"task\":\""  + label + "\",";
-  json += "\"last_detected_type\":" + String(lastDetectedType) + ",
+  json += "\"task\":\"" + label + "\",";
+  json += "\"last_detected_type\":" + String(lastDetectedType) + ",";
   json += "\"last_detected_name\":\"" + lastDetectedName + "\",";
   json += "\"last_source\":\"" + lastUpdateSource + "\",";
+  json += "\"ap_clients\":" + String(WiFi.softAPgetStationNum()) + ",";
+  json += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"sta_connected\":" + String((WiFi.status() == WL_CONNECTED) ? "true" : "false") + ",";
+  json += "\"sta_ip\":\"" + WiFi.localIP().toString() + "\",";
   json += "\"uptime_s\":" + String(millis() / 1000) + ",";
+
   long rearmInMs = (long)rearmAfterMs - (long)millis();
   if (rearmInMs < 0) rearmInMs = 0;
   json += "\"rearm_in_ms\":" + String(rearmInMs) + ",";
-  json += "\"angles\":[
+
+  json += "\"angles\":[";
   for (int i = 0; i < NUM_SERVOS; i++) {
     json += String(currentAngles[i]);
     if (i < NUM_SERVOS - 1) json += ",";
@@ -1077,11 +1095,36 @@ void setup() {
   sweepBlocking(startupAngles, SERVO_SPEED_STARTUP);
   Serial.println("[INIT] Ready.");
 
-  // WiFi
-  Serial.printf("\nConnecting to %s", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
+  // Network init (friend-style): AP always ON + optional STA
+  Serial.println("\n[NET] Initializing WiFi...");
+  if (ENABLE_STA) {
+    WiFi.mode(WIFI_AP_STA);
+    Serial.println("[NET] Mode: AP + STA");
+  } else {
+    WiFi.mode(WIFI_AP);
+    Serial.println("[NET] Mode: AP only");
+  }
+
+  WiFi.softAPConfig(AP_LOCAL_IP, AP_GATEWAY, AP_SUBNET);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.printf("[NET] AP SSID: %s\n", AP_SSID);
+  Serial.printf("[NET] AP IP  : %s\n", WiFi.softAPIP().toString().c_str());
+
+  if (ENABLE_STA) {
+    Serial.printf("[NET] STA connecting to %s", STA_SSID);
+    WiFi.begin(STA_SSID, STA_PASSWORD);
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("\n[NET] STA connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+      Serial.println("\n[NET] STA connect timeout. AP mode still active.");
+    }
+  }
 
   // ── HTTP Routes ───────────────────────────────────────────
 
@@ -1104,7 +1147,12 @@ void setup() {
     json += "\"status\":\"pong\",";
     json += "\"device\":\"RoboticArm_ESP32\",";
     json += "\"busy\":" + String(seqRunning ? "true" : "false") + ",";
-    json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+    json += "\"ap_ssid\":\"" + String(AP_SSID) + "\",";
+    json += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
+    json += "\"ap_clients\":" + String(WiFi.softAPgetStationNum()) + ",";
+    bool staConnected = (WiFi.status() == WL_CONNECTED);
+    json += "\"sta_connected\":" + String(staConnected ? "true" : "false") + ",";
+    json += "\"sta_ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"uptime_s\":" + String(millis() / 1000);
     json += "}";
     req->send(200, "application/json", json);
