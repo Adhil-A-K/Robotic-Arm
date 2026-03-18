@@ -1084,15 +1084,16 @@ void setup() {
   pca.setPWMFreq(PWM_FREQ_HZ);
   delay(10);
 
-  Serial.println("\n[INIT] Settling servos at 0°...");
+  // IMPORTANT:
+  // Do NOT force servos to 0° on boot. That caused shoulder dip (180° -> 0° -> 180°).
+  // Instead, sync directly to startup angles on power-up.
+  Serial.println("\n[INIT] Syncing servos directly to startup angles...");
   for (int i = 0; i < NUM_SERVOS; i++) {
-    writeServoNow(i, 0);
-    targetAngles[i] = 0;
+    int a = clampAngle(i, startupAngles[i]);
+    writeServoNow(i, a);
+    targetAngles[i] = a;
   }
-  delay(300);
-
-  Serial.println("[INIT] Sweeping to startup angles...");
-  sweepBlocking(startupAngles, SERVO_SPEED_STARTUP);
+  delay(120);
   Serial.println("[INIT] Ready.");
 
   // Network init (friend-style): AP always ON + optional STA
