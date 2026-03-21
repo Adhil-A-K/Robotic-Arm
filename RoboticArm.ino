@@ -90,19 +90,19 @@ ServoConfig servos[NUM_SERVOS] = {
   { "Shoulder", "💪", "Joint 1 / Lift",      CH_SHOULDER,   0, 180, 180 },
   { "Elbow",    "🦾", "Joint 2 / Reach",     CH_ELBOW,      0, 180,   0 },
   { "Wrist",    "🤚", "Joint 3 / Tilt",      CH_WRIST,     30, 180,  55 },
-  { "Gripper",  "✊", "End Effector",        CH_GRIPPER,    0,  90,  30 },
+  { "Gripper",  "✊", "End Effector",        CH_GRIPPER,    0, 180, 150 },
 };
 
 // ── Startup Target Angles ─────────────────────────────────────
 //                   Base  Shoulder  Elbow  Wrist  Gripper
-int startupAngles[NUM_SERVOS] = { 94, 180, 0, 55, 30 };
+int startupAngles[NUM_SERVOS] = { 94, 180, 0, 55, 150 };
 
 // ── Speed Settings ────────────────────────────────────────────
 #define SERVO_SPEED          60   // °/s  runtime
 
 // ── Gripper open/close angles ─────────────────────────────────
-#define GRIPPER_OPEN    0    // fully open
-#define GRIPPER_CLOSE   90   // fully closed (gripping)
+#define GRIPPER_OPEN    170  // open/ready (used before pickup and at drop)
+#define GRIPPER_CLOSE   140  // gripping
 
 // ── Sequence timing (for more natural movement) ───────────────
 #define SEQ_GRIP_SETTLE_MS       900
@@ -127,7 +127,7 @@ struct Preset {
 
 // NOTE: Gripper angle in presets = arm position (gripper open while moving,
 //       gripper closes/opens during pick/drop — handled by the sequence).
-//       The Gripper value here is the "approach" gripper state (open = 0).
+//       The Gripper value here is the "approach" gripper state (open = GRIPPER_OPEN).
 Preset presets[4] = {
   { "pickup1", "Paper — Pickup",   {  99,  93,  16, 126, GRIPPER_OPEN } },
   { "pickup2", "Plastic — Pickup", {  99,  93,  16, 126, GRIPPER_OPEN } },
@@ -1068,7 +1068,11 @@ function homeAll() {
 }
 function setGripper(mode) {
   const g = joints[joints.length - 1];
-  const angle = (mode === 'min') ? g.min : g.max;
+  // Keep button behavior aligned with firmware intent even when open > close.
+  const GRIPPER_OPEN_ANGLE = 170;
+  const GRIPPER_CLOSE_ANGLE = 140;
+  const desired = (mode === 'min') ? GRIPPER_OPEN_ANGLE : GRIPPER_CLOSE_ANGLE;
+  const angle = Math.min(g.max, Math.max(g.min, desired));
   document.getElementById(`sl${g.id}`).value = angle;
   onSlide(g.id, angle);
   sendAngle(g.id, angle);
