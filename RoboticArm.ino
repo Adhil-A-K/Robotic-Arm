@@ -404,8 +404,8 @@ void runSequence() {
       break;
 
     case SEQ_TRANSIT_FINAL:
-      Serial.printf("[SEQ] Step 7 — Return to transit height\n");
-      setAllAngles(transitAngles);
+      Serial.printf("[SEQ] Step 7 — Return all joints to home (idle pose)\n");
+      moveAllHome();
       seqStep++;
       break;
 
@@ -461,7 +461,7 @@ String buildStatusJson() {
     "Moving to drop",
     "Opening gripper",
     "Releasing...",
-    "Returning to transit",
+    "Returning to home",
     "Done"
   };
 
