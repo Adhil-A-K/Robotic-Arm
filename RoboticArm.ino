@@ -90,19 +90,19 @@ ServoConfig servos[NUM_SERVOS] = {
   { "Shoulder", "💪", "Joint 1 / Lift",      CH_SHOULDER,   0, 180, 180 },
   { "Elbow",    "🦾", "Joint 2 / Reach",     CH_ELBOW,      0, 180,   0 },
   { "Wrist",    "🤚", "Joint 3 / Tilt",      CH_WRIST,     30, 180,  55 },
-  { "Gripper",  "✊", "End Effector",        CH_GRIPPER,    0, 180, 150 },
+  { "Gripper",  "✊", "End Effector",        CH_GRIPPER,    0, 180, 110 },
 };
 
 // ── Startup Target Angles ─────────────────────────────────────
 //                   Base  Shoulder  Elbow  Wrist  Gripper
-int startupAngles[NUM_SERVOS] = { 94, 180, 0, 55, 150 };
+int startupAngles[NUM_SERVOS] = { 94, 180, 0, 55, 110 };
 
 // ── Speed Settings ────────────────────────────────────────────
 #define SERVO_SPEED          60   // °/s  runtime
 
 // ── Gripper open/close angles ─────────────────────────────────
 #define GRIPPER_OPEN    170  // open/ready (used before pickup and at drop)
-#define GRIPPER_CLOSE   140  // gripping
+#define GRIPPER_CLOSE   90   // gripping
 
 // ── Sequence timing (for more natural movement) ───────────────
 #define SEQ_GRIP_SETTLE_MS       900
@@ -1070,7 +1070,7 @@ function setGripper(mode) {
   const g = joints[joints.length - 1];
   // Keep button behavior aligned with firmware intent even when open > close.
   const GRIPPER_OPEN_ANGLE = 170;
-  const GRIPPER_CLOSE_ANGLE = 140;
+  const GRIPPER_CLOSE_ANGLE = 90;
   const desired = (mode === 'min') ? GRIPPER_OPEN_ANGLE : GRIPPER_CLOSE_ANGLE;
   const angle = Math.min(g.max, Math.max(g.min, desired));
   document.getElementById(`sl${g.id}`).value = angle;
@@ -1356,3 +1356,4 @@ void loop() {
   updateServos();
   runSequence();
 }
+
