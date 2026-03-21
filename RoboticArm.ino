@@ -98,7 +98,8 @@ ServoConfig servos[NUM_SERVOS] = {
 int startupAngles[NUM_SERVOS] = { 95, 180, 0, 55, 110 };
 
 // ── Speed Settings ────────────────────────────────────────────
-#define SERVO_SPEED          60   // °/s  runtime
+#define SERVO_SPEED          60   // °/s average runtime speed
+#define SERVO_EASE_MIN_MS   120   // minimum move time so easing is visible
 
 // ── Gripper open/close angles ─────────────────────────────────
 #define GRIPPER_OPEN    170  // open/ready (used before pickup and at drop)
@@ -141,6 +142,9 @@ int transitAngles[NUM_SERVOS] = { 95, 160, 20, 60, GRIPPER_OPEN };
 // ── Runtime State ─────────────────────────────────────────────
 int currentAngles[NUM_SERVOS] = { 0, 0, 0, 0, 0 };
 int targetAngles[NUM_SERVOS]  = { 0, 0, 0, 0, 0 };
+int motionStartAngles[NUM_SERVOS] = { 0, 0, 0, 0, 0 };
+unsigned long motionStartMs[NUM_SERVOS] = { 0, 0, 0, 0, 0 };
+unsigned long motionDurationMs[NUM_SERVOS] = { 0, 0, 0, 0, 0 };
 unsigned long lastStepMs = 0;
 
 // Sequence state machine
@@ -201,7 +205,25 @@ void setPcaOutputsEnabled(bool enable) {
 }
 
 void setServoAngle(int ch, int angle) {
-  targetAngles[ch] = clampAngle(ch, angle);
+  int clamped = clampAngle(ch, angle);
+
+  // If nothing changes, avoid restarting easing profile.
+  if (clamped == targetAngles[ch]) return;
+
+  int start = currentAngles[ch];
+  targetAngles[ch] = clamped;
+  motionStartAngles[ch] = start;
+  motionStartMs[ch] = millis();
+
+  int travel = abs(clamped - start);
+  if (travel <= 1) {
+    motionDurationMs[ch] = 0;
+    return;
+  }
+
+  unsigned long duration = (unsigned long)((1000.0f * travel) / SERVO_SPEED);
+  if (duration < SERVO_EASE_MIN_MS) duration = SERVO_EASE_MIN_MS;
+  motionDurationMs[ch] = duration;
 }
 
 void setAllAngles(int angles[NUM_SERVOS]) {
@@ -217,24 +239,44 @@ bool allAtTarget() {
   return true;
 }
 
-// ── Non-blocking smooth sweep ─────────────────────────────────
+// ── Non-blocking eased motion (S-curve: slow→fast→slow) ─────
 void updateServos() {
   unsigned long now = millis();
   unsigned long dt  = now - lastStepMs;
   if (dt < 20) return;
   lastStepMs = now;
 
-  float maxStep = (SERVO_SPEED * dt) / 1000.0f;
-
   for (int i = 0; i < NUM_SERVOS; i++) {
     int cur = currentAngles[i];
     int tgt = targetAngles[i];
     if (cur == tgt) continue;
-    int diff = tgt - cur;
-    int step = (abs(diff) <= (int)maxStep) ? diff
-                                           : (diff > 0 ? (int)maxStep : -(int)maxStep);
-    if (step == 0) step = (diff > 0) ? 1 : -1;
-    writeServoNow(i, cur + step);
+
+    unsigned long dur = motionDurationMs[i];
+    if (dur == 0) {
+      writeServoNow(i, tgt);
+      continue;
+    }
+
+    unsigned long elapsed = now - motionStartMs[i];
+    if (elapsed >= dur) {
+      writeServoNow(i, tgt);
+      motionDurationMs[i] = 0;
+      continue;
+    }
+
+    float t = (float)elapsed / (float)dur;               // 0..1
+    float eased = t * t * (3.0f - 2.0f * t);            // smoothstep S-curve
+
+    int start = motionStartAngles[i];
+    float interp = start + (tgt - start) * eased;
+    int next = (int)(interp + (interp >= 0 ? 0.5f : -0.5f));
+    next = clampAngle(i, next);
+
+    // Ensure progress if integer rounding stalls mid-motion.
+    if (next == cur) next += (tgt > cur) ? 1 : -1;
+    next = clampAngle(i, next);
+
+    writeServoNow(i, next);
   }
 }
 
