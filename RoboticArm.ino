@@ -86,7 +86,7 @@ struct ServoConfig {
 
 ServoConfig servos[NUM_SERVOS] = {
   //   name         icon   subtitle               ch           min  max  home
-  { "Base",     "🔄", "Rotation / Yaw",      CH_BASE,       0, 180,  94 },
+  { "Base",     "🔄", "Rotation / Yaw",      CH_BASE,       0, 180,  95 },
   { "Shoulder", "💪", "Joint 1 / Lift",      CH_SHOULDER,   0, 180, 180 },
   { "Elbow",    "🦾", "Joint 2 / Reach",     CH_ELBOW,      0, 180,   0 },
   { "Wrist",    "🤚", "Joint 3 / Tilt",      CH_WRIST,     30, 180,  55 },
@@ -95,7 +95,7 @@ ServoConfig servos[NUM_SERVOS] = {
 
 // ── Startup Target Angles ─────────────────────────────────────
 //                   Base  Shoulder  Elbow  Wrist  Gripper
-int startupAngles[NUM_SERVOS] = { 94, 180, 0, 55, 110 };
+int startupAngles[NUM_SERVOS] = { 95, 180, 0, 55, 110 };
 
 // ── Speed Settings ────────────────────────────────────────────
 #define SERVO_SPEED          60   // °/s  runtime
@@ -129,14 +129,14 @@ struct Preset {
 //       gripper closes/opens during pick/drop — handled by the sequence).
 //       The Gripper value here is the "approach" gripper state (open = GRIPPER_OPEN).
 Preset presets[4] = {
-  { "pickup1", "Paper — Pickup",   {  99,  93,  16, 126, GRIPPER_OPEN } },
-  { "pickup2", "Plastic — Pickup", {  99,  93,  16, 126, GRIPPER_OPEN } },
-  { "drop1",   "Paper — Drop",     {  69, 115, 180, 169, GRIPPER_OPEN } },
-  { "drop2",   "Plastic — Drop",   { 125, 115, 180, 169, GRIPPER_OPEN } },
+  { "pickup1", "Paper — Pickup",   { 100,  93,   7, 127, GRIPPER_OPEN } },
+  { "pickup2", "Plastic — Pickup", { 100,  93,   7, 127, GRIPPER_OPEN } },
+  { "drop1",   "Paper — Drop",     {  69, 110, 180, 175, GRIPPER_OPEN } },
+  { "drop2",   "Plastic — Drop",   { 125, 110, 180, 175, GRIPPER_OPEN } },
 };
 
 // Safe transit height (arm raised safely before moving between positions)
-int transitAngles[NUM_SERVOS] = { 90, 160, 20, 90, GRIPPER_OPEN };
+int transitAngles[NUM_SERVOS] = { 95, 160, 20, 60, GRIPPER_OPEN };
 
 // ── Runtime State ─────────────────────────────────────────────
 int currentAngles[NUM_SERVOS] = { 0, 0, 0, 0, 0 };
