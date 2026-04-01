@@ -38,9 +38,14 @@ static const char *AP_SSID     = "WasteBin_AP";
 static const char *AP_PASSWORD = "12345678";
 
 // Optional: also connect ESP32 to router while AP stays active.
-static const bool   ENABLE_STA   = true;
+// Keep false for maximum AP stability during local app testing.
+static const bool   ENABLE_STA   = false;
 static const char *STA_SSID      = "Motridox";
 static const char *STA_PASSWORD  = "Bassim@8371";
+
+// AP tuning
+#define AP_CHANNEL   6
+#define AP_MAX_CONN  4
 
 // Fixed AP IP (stable for app): http://192.168.4.1
 static const IPAddress AP_LOCAL_IP(192, 168, 4, 1);
@@ -1173,6 +1178,11 @@ void setup() {
 
   // Network init (friend-style): AP always ON + optional STA
   Serial.println("\n[NET] Initializing WiFi...");
+  WiFi.persistent(false);
+  WiFi.setSleep(false);             // reduce AP stalls from modem sleep
+  WiFi.disconnect(true, true);      // clear stale state
+  delay(120);
+
   if (ENABLE_STA) {
     WiFi.mode(WIFI_AP_STA);
     Serial.println("[NET] Mode: AP + STA");
@@ -1181,10 +1191,23 @@ void setup() {
     Serial.println("[NET] Mode: AP only");
   }
 
-  WiFi.softAPConfig(AP_LOCAL_IP, AP_GATEWAY, AP_SUBNET);
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
-  Serial.printf("[NET] AP SSID: %s\n", AP_SSID);
-  Serial.printf("[NET] AP IP  : %s\n", WiFi.softAPIP().toString().c_str());
+  bool apCfgOk = WiFi.softAPConfig(AP_LOCAL_IP, AP_GATEWAY, AP_SUBNET);
+  bool apOk = WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, false, AP_MAX_CONN);
+
+  // One recovery retry if AP failed to start
+  if (!apOk) {
+    Serial.println("[NET] AP start failed, retrying once...");
+    WiFi.mode(WIFI_OFF);
+    delay(200);
+    WiFi.mode(ENABLE_STA ? WIFI_AP_STA : WIFI_AP);
+    apCfgOk = WiFi.softAPConfig(AP_LOCAL_IP, AP_GATEWAY, AP_SUBNET);
+    apOk = WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, false, AP_MAX_CONN);
+  }
+
+  Serial.printf("[NET] AP config: %s\n", apCfgOk ? "OK" : "FAILED");
+  Serial.printf("[NET] AP start : %s\n", apOk ? "OK" : "FAILED");
+  Serial.printf("[NET] AP SSID  : %s\n", AP_SSID);
+  Serial.printf("[NET] AP IP    : %s\n", WiFi.softAPIP().toString().c_str());
 
   if (ENABLE_STA) {
     Serial.printf("[NET] STA connecting to %s", STA_SSID);
@@ -1230,6 +1253,61 @@ void setup() {
     json += "\"sta_connected\":" + String(staConnected ? "true" : "false") + ",";
     json += "\"sta_ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"uptime_s\":" + String(millis() / 1000);
+    json += "}";
+    req->send(200, "application/json", json);
+  });
+
+  // /update (GET) — compatibility mode for apps that send query params
+  // Examples:
+  //   /update?bin_type=0
+  //   /update?obj=1
+  //   /update?type=paper
+  server.on("/update", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (seqRunning) {
+      req->send(200, "application/json",
+        "{\"accepted\":false,\"ignored\":true,\"reason\":\"busy\"}");
+      return;
+    }
+
+    if (millis() < rearmAfterMs) {
+      req->send(200, "application/json",
+        "{\"accepted\":false,\"ignored\":true,\"reason\":\"rearming\"}");
+      return;
+    }
+
+    int obj = -1;
+
+    if (req->hasParam("bin_type")) {
+      int t = req->getParam("bin_type")->value().toInt();
+      if (t == 0 || t == 1) obj = t;
+    } else if (req->hasParam("obj")) {
+      int t = req->getParam("obj")->value().toInt();
+      if (t == 0 || t == 1) obj = t;
+    }
+
+    if (obj < 0) {
+      const char* keys[] = { "status", "type", "label", "material", "waste_type", "bin_name", "class" };
+      for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        if (!req->hasParam(keys[i])) continue;
+        String v = req->getParam(keys[i])->value();
+        v.toLowerCase();
+        if (v.indexOf("paper") >= 0 || v.indexOf("metal") >= 0 || v == "0") { obj = 0; break; }
+        if (v.indexOf("plastic") >= 0 || v == "1") { obj = 1; break; }
+      }
+    }
+
+    if (obj < 0) {
+      req->send(400, "application/json",
+        "{\"error\":\"Invalid query. Use bin_type=0|1 or obj=0|1 or include paper/plastic text\"}");
+      return;
+    }
+
+    startSequence(obj, "app-get");
+
+    String json = "{";
+    json += "\"accepted\":true,";
+    json += "\"queued\":\"" + String(objectName(obj)) + "\",";
+    json += "\"busy\":true";
     json += "}";
     req->send(200, "application/json", json);
   });
