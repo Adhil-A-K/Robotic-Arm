@@ -92,8 +92,10 @@ Preset presets[MAX_PRESETS];
 int presetCount = 0;
 bool sequenceRunning = false;
 int currentPresetIndex = 0;
-  // Sequence execution delay (ms) — adjustable via UI
-  int sequenceDelayMs = 1000;
+unsigned long sequenceLastMoveMs = 0;
+bool sequenceAtPreset = false;
+// Sequence execution delay (ms) — adjustable via UI
+int sequenceDelayMs = 1000;
 
 // ── Web Server ────────────────────────────────────────────────
 AsyncWebServer server(80);
@@ -109,6 +111,29 @@ uint16_t angleToPwm(int angle, int minAngle, int maxAngle) {
 
 int clampAngle(int ch, int angle) {
   return constrain(angle, servos[ch].minAngle, servos[ch].maxAngle);
+}
+
+String jsonEscape(const String& input) {
+  String out;
+  out.reserve(input.length() + 8);
+
+  for (size_t i = 0; i < input.length(); i++) {
+    char c = input[i];
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        out += c;
+        break;
+    }
+  }
+
+  return out;
 }
 
 void writeServoNow(int ch, int angle) {
@@ -224,26 +249,37 @@ void startSequence() {
   if (presetCount == 0 || sequenceRunning) return;
   sequenceRunning = true;
   currentPresetIndex = 0;
+  sequenceAtPreset = false;
   setAllAngles(presets[0].angles);
 }
 
 void runSequence() {
   if (!sequenceRunning) return;
-  
-  if (allAtTarget()) {
-    unsigned long now = millis();
-    static unsigned long lastMoveTime = 0;
-    
-    if (now - lastMoveTime >= sequenceDelayMs) {
-      currentPresetIndex++;
-      if (currentPresetIndex >= presetCount) {
-        sequenceRunning = false;
-        return;
-      }
-      setAllAngles(presets[currentPresetIndex].angles);
-      lastMoveTime = now;
-    }
+
+  if (!allAtTarget()) {
+    sequenceAtPreset = false;
+    return;
   }
+
+  unsigned long now = millis();
+  if (!sequenceAtPreset) {
+    sequenceAtPreset = true;
+    sequenceLastMoveMs = now;
+    return;
+  }
+
+  if (now - sequenceLastMoveMs < (unsigned long)sequenceDelayMs) return;
+
+  currentPresetIndex++;
+  if (currentPresetIndex >= presetCount) {
+    sequenceRunning = false;
+    currentPresetIndex = 0;
+    sequenceAtPreset = false;
+    return;
+  }
+
+  setAllAngles(presets[currentPresetIndex].angles);
+  sequenceAtPreset = false;
 }
 
 // ── JSON builders ────────────────────────────────────────────
@@ -264,9 +300,10 @@ String buildConfigJson() {
     json += "}";
     if (i < NUM_SERVOS - 1) json += ",";
   }
+
   json += "],\"presets\":[";
   for (int p = 0; p < presetCount; p++) {
-    json += "{\"id\":" + String(p) + ",\"name\":\"" + presets[p].name + "\",\"angles\":[";
+    json += "{\"id\":" + String(p) + ",\"name\":\"" + jsonEscape(presets[p].name) + "\",\"angles\":[";
     for (int i = 0; i < NUM_SERVOS; i++) {
       json += String(presets[p].angles[i]);
       if (i < NUM_SERVOS - 1) json += ",";
@@ -274,9 +311,11 @@ String buildConfigJson() {
     json += "]}";
     if (p < presetCount - 1) json += ",";
   }
-  json += "],\"sequenceRunning\":" + String(sequenceRunning ? "true" : "false") + 
+
+  json += "],\"sequenceRunning\":" + String(sequenceRunning ? "true" : "false") + ",";
   json += "\"sequenceDelayMs\":" + String(sequenceDelayMs) + ",";
   json += "\"currentPresetIndex\":" + String(currentPresetIndex);
+  json += "}";
   return json;
 }
 
@@ -365,8 +404,7 @@ const char HTML_PAGE[] PROGMEM = R"=====(
     gap: 16px; 
     max-width: 1100px; 
     margin: 0 auto 24px;
-    min-height: 200px; /* Ensure grid has minimum height */
-    border: 2px solid red; /* DEBUG: make grid visible */
+    min-height: 200px;
   }
   
   .card {
@@ -377,8 +415,7 @@ const char HTML_PAGE[] PROGMEM = R"=====(
     position: relative;
     overflow: hidden;
     transition: border-color 0.3s, box-shadow 0.3s;
-    min-height: 300px; /* Ensure cards have minimum height */
-    border: 2px solid blue; /* DEBUG: make cards visible */
+    min-height: 300px;
   }
   .card::before {
     content: ''; position: absolute;
@@ -466,6 +503,11 @@ const char HTML_PAGE[] PROGMEM = R"=====(
   .btn-save:hover { background: rgba(34,197,94,0.2); }
   .btn-run { border-color: var(--accent); color: var(--accent); background: rgba(0,212,255,0.08); }
   .btn-run:hover { background: rgba(0,212,255,0.2); box-shadow: var(--glow); }
+  .btn-run:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    box-shadow: none;
+  }
 
   /* Preset Table */
   .preset-table-container {
@@ -473,7 +515,8 @@ const char HTML_PAGE[] PROGMEM = R"=====(
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 14px; padding: 24px;
-  // Add delay control to preset controls
+  }
+
   .preset-controls {
     display: flex; gap: 12px; margin-bottom: 16px;
     align-items: center;
@@ -519,7 +562,6 @@ const char HTML_PAGE[] PROGMEM = R"=====(
   td {
     padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,0.05);
   }
-  // Add running indicator styles
   .preset-running {
     background: rgba(34,197,94,0.15);
     border-left: 3px solid var(--green);
@@ -537,6 +579,24 @@ const char HTML_PAGE[] PROGMEM = R"=====(
   
   .preset-id.idle {
     color: var(--dim);
+  }
+
+  .btn-table {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--accent);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.68rem;
+    padding: 4px 8px;
+    margin-right: 6px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .btn-table:hover {
+    border-color: var(--accent);
+    background: rgba(0,212,255,0.12);
   }
   .btn-delete:hover { border-color: #ef4444; color: #ef4444; }
 
@@ -571,7 +631,6 @@ const char HTML_PAGE[] PROGMEM = R"=====(
 <!-- ── Preset Sequencing ───────────────────────────────────── -->
 <div class="section-title">📍 Preset Sequencing</div>
 <div class="preset-table-container">
-  // Add delay control to preset controls
   <div class="preset-controls">
     <input type="text" id="presetName" placeholder="Enter preset name...">
     <button class="action-btn btn-save" onclick="saveCurrentPreset()">💾 Save Preset</button>
@@ -606,244 +665,330 @@ const char HTML_PAGE[] PROGMEM = R"=====(
 let joints = [];
 let presets = [];
 let seqPoll = null;
-// Load config (joints + presets)
-console.log('Starting config fetch...');
-fetch('/config')
-  .then(r => {
-    console.log('Config fetch response status:', r.status);
+let toastTimer = null;
+
+function fetchJson(url) {
+  return fetch(url).then((r) => {
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return r.json();
-  })
-  .then(data => {
-    console.log('Config data received:', data);
-    joints = data.servos.map(s => ({
-      id: s.id, name: s.name, icon: s.icon, sub: s.sub,
-      min: s.min, max: s.max, home: s.home, val: s.current,
-      speed: s.speed, easeMin: s.easeMin
-    }));
-    presets = data.presets;
-    console.log('Joints parsed:', joints.length);
-    console.log('Presets parsed:', presets.length);
-    
-    buildServoUI();
-    buildPresetTable();
-    if (data.sequenceRunning) setSeqRunning(true);
-    if (!seqPoll) seqPoll = setInterval(pollStatus, 500);
-  })
-  .catch(error => {
-    console.error('Failed to load config:', error);
-    document.getElementById('loading').textContent = '⚠ Failed to load config';
   });
-
-// ── Servo UI ─────────────────────────────────────────────────
-function buildServoUI() {
-  console.log('buildServoUI() called');
-  try {
-    const grid = document.getElementById('servoGrid');
-    if (!grid) {
-      console.error('servoGrid element not found');
-      return;
-    }
-    console.log('Found servoGrid:', grid);
-    
-    grid.innerHTML = '';
-    console.log('Cleared grid, joints count:', joints.length);
-    
-    joints.forEach((j, index) => {
-      console.log('Creating card for joint', index, j.name);
-      const card = document.createElement('div');
-      card.className = 'card';
-      card.innerHTML = `
-        <div class="card-header">
-          <div class="joint-label">
-            <div class="joint-icon">${j.icon}</div>
-            <div>
-              <div class="joint-name">${j.name}</div>
-              <div class="joint-sub">${j.sub}</div>
-            </div>
-          </div>
-          <div class="angle-display" id="disp${j.id}">${j.val}°</div>
-        </div>
-        
-        <div class="input-row">
-          <label>MIN</label>
-          <input type="number" id="min${j.id}" value="${j.min}" 
-                 onchange="updateServoLimits(${j.id})" min="0" max="180">
-          <label>MAX</label>
-          <input type="number" id="max${j.id}" value="${j.max}" 
-                 onchange="updateServoLimits(${j.id})" min="0" max="180">
-        </div>
-        
-        <div class="input-row">
-          <label>SPEED</label>
-          <input type="number" id="speed${j.id}" value="${j.speed}" 
-                 onchange="updateServoSpeed(${j.id})" min="10" max="200">
-          <label>EASE</label>
-          <input type="number" id="ease${j.id}" value="${j.easeMin}" 
-                 onchange="updateServoEase(${j.id})" min="50" max="500">
-        </div>
-        
-        <input type="range" id="sl${j.id}" min="${j.min}" max="${j.max}" value="${j.val}"
-          oninput="onSlide(${j.id}, this.value)"
-          onchange="sendAngle(${j.id}, this.value)">
-        <div class="range-labels"><span>${j.min}°</span><span>${j.max}°</span></div>
-      `;
-      grid.appendChild(card);
-      console.log('Added card for', j.name);
-    });
-    console.log('buildServoUI() completed successfully');
-  } catch (error) {
-    console.error('Error in buildServoUI:', error);
-  }
 }
 
-function updateServoLimits(id) {
-  const min = parseInt(document.getElementById(`min${id}`).value);
-  const max = parseInt(document.getElementById(`max${id}`).value);
-  const slider = document.getElementById(`sl${id}`);
-  
-  if (min >= 0 && max <= 180 && min < max) {
-    slider.min = min;
-    slider.max = max;
-    // Clamp current value
-    let val = parseInt(slider.value);
-    val = Math.min(max, Math.max(min, val));
-    slider.value = val;
-    onSlide(id, val);
-    sendAngle(id, val);
-    showToast(`${joints[id].name} limits: ${min}°–${max}°`);
-  } else {
-    showToast('⚠ Invalid range: min < max and 0≤value≤180', true);
-  }
-}
-
-function updateServoSpeed(id) {
-  const speed = parseInt(document.getElementById(`speed${id}`).value);
-  if (speed >= 10 && speed <= 200) {
-    fetch(`/set_speed?id=${id}&speed=${speed}`)
-      .then(() => showToast(`${joints[id].name} speed → ${speed}°/s`))
-      .catch(() => showToast('⚠ Connection error', true));
-  }
-}
-
-function updateServoEase(id) {
-  const ease = parseInt(document.getElementById(`ease${id}`).value);
-  if (ease >= 50 && ease <= 500) {
-    fetch(`/set_ease?id=${id}&ease=${ease}`)
-      .then(() => showToast(`${joints[id].name} ease → ${ease}ms`))
-  // Add Go To preset function
-  function gotoPreset(idx) {
-    const angles = presets[idx].angles;
-    joints.forEach((j, i) => {
-      document.getElementById(`sl${i}`).value = angles[i];
-      onSlide(i, angles[i]);
-      j.val = angles[i];
-    });
-    
-    // Send all angles to firmware
-    const promises = angles.map((a, i) => 
-      fetch(`/set?ch=${i}&angle=${a}`).catch(() => {})
-    );
-    
-    Promise.all(promises).then(() => 
-      showToast(`Moved to preset: ${presets[idx].name}`)
-    );
-  }
-  
-  // Add delay control functions
-  function updateDelayValue(val) {
-    document.getElementById('delayValue').textContent = val;
-  }
-  
-  function setSequenceDelay(ms) {
-    fetch(`/set_delay?ms=${ms}`)
-      .then(() => showToast(`Sequence delay → ${ms}ms`))
-      .catch(() => showToast('⚠ Delay update failed', true));
-  }
-  
-  // Update buildPresetTable to use config data
-  function buildPresetTable() {
-    fetch('/config')
-      .then(r => r.json())
-      .then(data => {
-        presets = data.presets;
-        const tbody = document.getElementById('presetTableBody');
-        tbody.innerHTML = '';
-        
-        if (presets.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--dim)">No presets saved yet</td></tr>';
-          return;
-        }
-        
-        // Add Go To button and running indicator to table rows
-        presets.forEach((p, idx) => {
-          const row = document.createElement('tr');
-          row.id = `preset-row-${idx}`;
-          row.className = (idx === data.currentPresetIndex && data.sequenceRunning) ? 'preset-running' : '';
-          
-          const isRunning = (idx === data.currentPresetIndex && data.sequenceRunning);
-          const idClass = isRunning ? 'preset-id running' : 'preset-id idle';
-          
-          row.innerHTML = `
-            <td class="${idClass}">${idx}</td>
-            <td>${p.name}</td>
-            <td>${formatAngles(p.angles)}</td>
-            <td>
-              <button class="btn-table" onclick="gotoPreset(${idx})">▶ Go To</button>
-              <button class="btn-table" onclick="overwritePreset(${idx})">💾 Save</button>
-              <button class="btn-table btn-delete" onclick="deletePreset(${idx})">🗑 Delete</button>
-            </td>
-          `;
-          tbody.appendChild(row);
-        });
-      })
-      .catch(() => showToast('⚠ Failed to refresh presets', true));
-  }
+function formatAngles(angles) {
   const names = ['Base', 'Shoulder', 'Elbow', 'Wrist', 'Gripper'];
   return angles.map((a, i) => `${names[i]}:${a}°`).join(' | ');
 }
 
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function setSeqRunning(running) {
+  const btn = document.getElementById('btnRun');
+  if (btn) btn.disabled = running;
+}
+
+function updateRunningRow(currentIdx, running) {
+  const rows = document.querySelectorAll('#presetTableBody tr[data-preset-idx]');
+  rows.forEach((row) => {
+    row.classList.remove('preset-running');
+    const idCell = row.querySelector('.preset-id');
+    if (idCell) {
+      idCell.classList.remove('running');
+      idCell.classList.add('idle');
+    }
+  });
+
+  if (!running) return;
+  const active = document.querySelector(`#presetTableBody tr[data-preset-idx="${currentIdx}"]`);
+  if (!active) return;
+  active.classList.add('preset-running');
+  const idCell = active.querySelector('.preset-id');
+  if (idCell) {
+    idCell.classList.remove('idle');
+    idCell.classList.add('running');
+  }
+}
+
+function updateDelayValue(val) {
+  document.getElementById('delayValue').textContent = String(val);
+}
+
+function setDelayControl(ms) {
+  const slider = document.getElementById('delaySlider');
+  if (!slider) return;
+  slider.value = ms;
+  updateDelayValue(ms);
+}
+
+function buildServoUI() {
+  const grid = document.getElementById('servoGrid');
+  if (!grid) return;
+  grid.innerHTML = '';
+
+  if (!joints.length) {
+    grid.innerHTML = '<div id="loading">No joints available</div>';
+    return;
+  }
+
+  joints.forEach((j) => {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `
+      <div class="card-header">
+        <div class="joint-label">
+          <div class="joint-icon">${j.icon}</div>
+          <div>
+            <div class="joint-name">${j.name}</div>
+            <div class="joint-sub">${j.sub}</div>
+          </div>
+        </div>
+        <div class="angle-display" id="disp${j.id}">${j.val}°</div>
+      </div>
+
+      <div class="input-row">
+        <label>MIN</label>
+        <input type="number" id="min${j.id}" value="${j.min}"
+               onchange="updateServoLimits(${j.id})" min="0" max="180">
+        <label>MAX</label>
+        <input type="number" id="max${j.id}" value="${j.max}"
+               onchange="updateServoLimits(${j.id})" min="0" max="180">
+      </div>
+
+      <div class="input-row">
+        <label>SPEED</label>
+        <input type="number" id="speed${j.id}" value="${j.speed}"
+               onchange="updateServoSpeed(${j.id})" min="10" max="200">
+        <label>EASE</label>
+        <input type="number" id="ease${j.id}" value="${j.easeMin}"
+               onchange="updateServoEase(${j.id})" min="50" max="500">
+      </div>
+
+      <input type="range" id="sl${j.id}" min="${j.min}" max="${j.max}" value="${j.val}"
+        oninput="onSlide(${j.id}, this.value)"
+        onchange="sendAngle(${j.id}, this.value)">
+      <div class="range-labels"><span>${j.min}°</span><span>${j.max}°</span></div>
+    `;
+    grid.appendChild(card);
+  });
+}
+
+function buildPresetTable(currentIdx = -1, running = false) {
+  const tbody = document.getElementById('presetTableBody');
+  if (!tbody) return;
+
+  tbody.innerHTML = '';
+  if (!presets.length) {
+    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--dim)">No presets saved yet</td></tr>';
+    return;
+  }
+
+  presets.forEach((p, idx) => {
+    const row = document.createElement('tr');
+    row.dataset.presetIdx = String(idx);
+
+    const isRunning = running && idx === currentIdx;
+    const idClass = `preset-id ${isRunning ? 'running' : 'idle'}`;
+    if (isRunning) row.classList.add('preset-running');
+
+    row.innerHTML = `
+      <td class="${idClass}">${idx}</td>
+      <td>${escapeHtml(p.name)}</td>
+      <td>${formatAngles(p.angles)}</td>
+      <td>
+        <button class="btn-table" onclick="gotoPreset(${idx})">▶ Go To</button>
+        <button class="btn-table" onclick="overwritePreset(${idx})">💾 Save</button>
+        <button class="btn-table btn-delete" onclick="deletePreset(${idx})">🗑 Delete</button>
+      </td>
+    `;
+    tbody.appendChild(row);
+  });
+}
+
+function loadConfigAndRender() {
+  fetchJson('/config')
+    .then((data) => {
+      joints = (data.servos || []).map((s) => ({
+        id: s.id,
+        name: s.name,
+        icon: s.icon,
+        sub: s.sub,
+        min: s.min,
+        max: s.max,
+        home: s.home,
+        val: s.current,
+        speed: s.speed,
+        easeMin: s.easeMin
+      }));
+
+      presets = data.presets || [];
+      setDelayControl(data.sequenceDelayMs || 1000);
+      buildServoUI();
+      buildPresetTable(data.currentPresetIndex ?? -1, Boolean(data.sequenceRunning));
+      setSeqRunning(Boolean(data.sequenceRunning));
+
+      if (!seqPoll) seqPoll = setInterval(pollStatus, 500);
+    })
+    .catch(() => {
+      const loading = document.getElementById('loading');
+      if (loading) loading.textContent = '⚠ Failed to load config';
+      showToast('⚠ Failed to load config', true);
+    });
+}
+
+function updateServoLimits(id) {
+  const minInput = document.getElementById(`min${id}`);
+  const maxInput = document.getElementById(`max${id}`);
+  const slider = document.getElementById(`sl${id}`);
+  if (!minInput || !maxInput || !slider) return;
+
+  const min = parseInt(minInput.value, 10);
+  const max = parseInt(maxInput.value, 10);
+
+  if (!Number.isInteger(min) || !Number.isInteger(max) || min < 0 || max > 180 || min >= max) {
+    showToast('⚠ Invalid range: min < max and 0≤value≤180', true);
+    return;
+  }
+
+  joints[id].min = min;
+  joints[id].max = max;
+  slider.min = String(min);
+  slider.max = String(max);
+
+  let val = parseInt(slider.value, 10);
+  val = Math.min(max, Math.max(min, val));
+  slider.value = String(val);
+  onSlide(id, val);
+  sendAngle(id, val);
+  showToast(`${joints[id].name} limits: ${min}°–${max}°`);
+}
+
+function updateServoSpeed(id) {
+  const input = document.getElementById(`speed${id}`);
+  if (!input) return;
+
+  const speed = parseInt(input.value, 10);
+  if (!Number.isInteger(speed) || speed < 10 || speed > 200) {
+    showToast('⚠ Speed must be 10–200°/s', true);
+    return;
+  }
+
+  fetch(`/set_speed?id=${id}&speed=${speed}`)
+    .then((r) => {
+      if (!r.ok) throw new Error('Bad speed');
+      joints[id].speed = speed;
+      showToast(`${joints[id].name} speed → ${speed}°/s`);
+    })
+    .catch(() => showToast('⚠ Speed update failed', true));
+}
+
+function updateServoEase(id) {
+  const input = document.getElementById(`ease${id}`);
+  if (!input) return;
+
+  const ease = parseInt(input.value, 10);
+  if (!Number.isInteger(ease) || ease < 50 || ease > 500) {
+    showToast('⚠ Ease must be 50–500ms', true);
+    return;
+  }
+
+  fetch(`/set_ease?id=${id}&ease=${ease}`)
+    .then((r) => {
+      if (!r.ok) throw new Error('Bad ease');
+      joints[id].easeMin = ease;
+      showToast(`${joints[id].name} ease → ${ease}ms`);
+    })
+    .catch(() => showToast('⚠ Ease update failed', true));
+}
+
+function setSequenceDelay(ms) {
+  const delay = parseInt(ms, 10);
+  if (!Number.isInteger(delay) || delay < 200 || delay > 2000) {
+    showToast('⚠ Delay must be 200–2000ms', true);
+    return;
+  }
+
+  fetch(`/set_delay?ms=${delay}`)
+    .then((r) => {
+      if (!r.ok) throw new Error('Delay failed');
+      updateDelayValue(delay);
+      showToast(`Sequence delay → ${delay}ms`);
+    })
+    .catch(() => showToast('⚠ Delay update failed', true));
+}
+
+function gotoPreset(idx) {
+  if (!presets[idx]) return;
+  fetch(`/goto_preset?id=${idx}`)
+    .then((r) => {
+      if (!r.ok) throw new Error('Go To failed');
+      showToast(`Moving to preset: ${presets[idx].name}`);
+    })
+    .catch(() => showToast('⚠ Go To preset failed', true));
+}
+
 function saveCurrentPreset() {
-  const name = document.getElementById('presetName').value.trim();
+  const nameEl = document.getElementById('presetName');
+  if (!nameEl) return;
+  const name = nameEl.value.trim();
+
   if (!name) {
     showToast('⚠ Enter a preset name', true);
     return;
   }
-  
-  const angles = joints.map(j => j.val);
+
+  const angles = joints.map((j) => j.val);
   fetch(`/save_preset?name=${encodeURIComponent(name)}&a0=${angles[0]}&a1=${angles[1]}&a2=${angles[2]}&a3=${angles[3]}&a4=${angles[4]}`)
-    .then(r => r.json())
-    .then(data => {
-      presets = data.presets;
-      buildPresetTable();
+    .then((r) => {
+      if (!r.ok) throw new Error('Save failed');
+      return r.json();
+    })
+    .then((data) => {
+      presets = data.presets || [];
+      buildPresetTable(data.currentPresetIndex ?? -1, Boolean(data.sequenceRunning));
+      nameEl.value = '';
       showToast(`Saved: ${name}`);
-      document.getElementById('presetName').value = '';
     })
     .catch(() => showToast('⚠ Save failed', true));
 }
 
 function overwritePreset(idx) {
+  if (!presets[idx]) return;
+
   const name = prompt('Enter new name (or keep current):', presets[idx].name);
   if (!name) return;
-  
-  const angles = joints.map(j => j.val);
+
+  const angles = joints.map((j) => j.val);
   fetch(`/overwrite_preset?id=${idx}&name=${encodeURIComponent(name)}&a0=${angles[0]}&a1=${angles[1]}&a2=${angles[2]}&a3=${angles[3]}&a4=${angles[4]}`)
-    .then(r => r.json())
-    .then(data => {
-      presets = data.presets;
-      buildPresetTable();
-      showToast(`Overwritten preset ${idx}`);
+    .then((r) => {
+      if (!r.ok) throw new Error('Overwrite failed');
+      return r.json();
+    })
+    .then((data) => {
+      presets = data.presets || [];
+      buildPresetTable(data.currentPresetIndex ?? -1, Boolean(data.sequenceRunning));
+      showToast(`Updated preset ${idx}`);
     })
     .catch(() => showToast('⚠ Overwrite failed', true));
 }
 
 function deletePreset(idx) {
+  if (!presets[idx]) return;
   if (!confirm(`Delete preset ${idx}: ${presets[idx].name}?`)) return;
-  
+
   fetch(`/delete_preset?id=${idx}`)
-    .then(r => r.json())
-    .then(data => {
-      presets = data.presets;
-      buildPresetTable();
+    .then((r) => {
+      if (!r.ok) throw new Error('Delete failed');
+      return r.json();
+    })
+    .then((data) => {
+      presets = data.presets || [];
+      buildPresetTable(data.currentPresetIndex ?? -1, Boolean(data.sequenceRunning));
       showToast(`Deleted preset ${idx}`);
     })
     .catch(() => showToast('⚠ Delete failed', true));
@@ -851,64 +996,77 @@ function deletePreset(idx) {
 
 function runSequence() {
   fetch('/run_sequence')
-    .then(r => r.text())
-    .then(t => {
+    .then((r) => r.text())
+    .then((t) => {
       if (t === 'OK') {
-        showToast('Sequence started');
         setSeqRunning(true);
+        showToast('Sequence started');
       } else {
-        showToast('⚠ ' + t, true);
+        showToast(`⚠ ${t}`, true);
       }
+      pollStatus();
     })
     .catch(() => showToast('⚠ Connection error', true));
 }
 
-function setSeqRunning(running) {
-  document.getElementById('btnRun').disabled = running;
-}
-
 function pollStatus() {
-  fetch('/status')
-    .then(r => r.json())
-    .then(s => {
-      if (!s.busy) setSeqRunning(false);
-      // Update slider displays from live angles
-      s.angles.forEach((a, i) => {
-        const sl = document.getElementById('sl' + i);
-        const dp = document.getElementById('disp' + i);
-        if (sl && !sl.matches(':active')) { sl.value = a; joints[i].val = a; }
-        if (dp && !sl.matches(':active')) { dp.textContent = a + '°'; }
-      });
+  fetchJson('/status')
+    .then((s) => {
+      const running = Boolean(s.busy);
+      setSeqRunning(running);
+      updateRunningRow(s.current_preset, running);
+
+      if (Array.isArray(s.angles)) {
+        s.angles.forEach((a, i) => {
+          const sl = document.getElementById(`sl${i}`);
+          const dp = document.getElementById(`disp${i}`);
+          if (!sl || !dp) return;
+
+          if (!sl.matches(':active')) {
+            sl.value = String(a);
+            joints[i].val = a;
+            dp.textContent = `${a}°`;
+          }
+        });
+      }
     })
     .catch(() => {});
 }
 
-// ── Servo controls ───────────────────────────────────────────
 function onSlide(id, val) {
-  document.getElementById(`disp${id}`).textContent = val + '°';
+  const angle = parseInt(val, 10);
+  joints[id].val = angle;
+  const display = document.getElementById(`disp${id}`);
+  if (display) display.textContent = `${angle}°`;
 }
 
 function sendAngle(id, val) {
-  val = parseInt(val);
-  const j = joints[id];
-  val = Math.min(j.max, Math.max(j.min, val));
-  j.val = val;
-  fetch(`/set?ch=${id}&angle=${val}`)
-    .then(r => r.text())
-    .then(() => showToast(`${j.name} → ${val}°`))
+  let angle = parseInt(val, 10);
+  const joint = joints[id];
+  angle = Math.min(joint.max, Math.max(joint.min, angle));
+  joint.val = angle;
+
+  fetch(`/set?ch=${id}&angle=${angle}`)
+    .then((r) => {
+      if (!r.ok) throw new Error('Set failed');
+      showToast(`${joint.name} → ${angle}°`);
+    })
     .catch(() => showToast('⚠ Connection error', true));
 }
 
-// Toast
-let toastTimer;
 function showToast(msg, isErr = false) {
   const t = document.getElementById('toast');
+  if (!t) return;
+
   t.textContent = msg;
   t.className = `toast ${isErr ? 'error' : ''}`;
   t.classList.add('show');
+
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
 }
+
+loadConfigAndRender();
 </script>
 </body>
 </html>
