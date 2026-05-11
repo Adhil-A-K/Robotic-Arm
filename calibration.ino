@@ -36,6 +36,16 @@
 static const char *STA_SSID      = "Motridox";
 static const char *STA_PASSWORD  = "Bassim@8371";
 
+// ── Boot movement mitigation (optional hardware assist) ──────
+// If you wire PCA9685 OE pin to an ESP32 GPIO, boot twitch can be minimized:
+// - Keep outputs disabled during init
+// - Program startup angles
+// - Then enable outputs
+// PCA9685 OE is ACTIVE-HIGH (HIGH=disabled, LOW=enabled).
+// Set to -1 if OE is not wired.
+static const int PCA_OE_PIN = 25;
+#define PCA_OUTPUT_ENABLE_DELAY_MS  80
+
 // ── PCA9685 ───────────────────────────────────────────────────
 Adafruit_PWMServoDriver pca = Adafruit_PWMServoDriver(0x40);
 
@@ -141,6 +151,12 @@ void writeServoNow(int ch, int angle) {
   uint16_t tick = angleToPwm(angle, servos[ch].minAngle, servos[ch].maxAngle);
   pca.setPWM(servos[ch].channel, 0, tick);
   currentAngles[ch] = angle;
+}
+
+void setPcaOutputsEnabled(bool enable) {
+  if (PCA_OE_PIN < 0) return;
+  // OE active-high: HIGH disables outputs, LOW enables outputs.
+  digitalWrite(PCA_OE_PIN, enable ? LOW : HIGH);
 }
 
 void setServoAngle(int ch, int angle) {
@@ -288,6 +304,7 @@ String buildConfigJson() {
   for (int i = 0; i < NUM_SERVOS; i++) {
     json += "{";
     json += "\"id\":"      + String(i)                   + ",";
+    json += "\"channel\":" + String(servos[i].channel)    + ",";
     json += "\"name\":\""  + String(servos[i].name)      + "\",";
     json += "\"icon\":\""  + String(servos[i].icon)      + "\",";
     json += "\"sub\":\""   + String(servos[i].sub)       + "\",";
@@ -314,7 +331,9 @@ String buildConfigJson() {
 
   json += "],\"sequenceRunning\":" + String(sequenceRunning ? "true" : "false") + ",";
   json += "\"sequenceDelayMs\":" + String(sequenceDelayMs) + ",";
-  json += "\"currentPresetIndex\":" + String(currentPresetIndex);
+  json += "\"currentPresetIndex\":" + String(currentPresetIndex) + ",";
+  json += "\"pcaOePin\":" + String(PCA_OE_PIN) + ",";
+  json += "\"pcaOutputEnableDelayMs\":" + String(PCA_OUTPUT_ENABLE_DELAY_MS);
   json += "}";
   return json;
 }
@@ -503,6 +522,8 @@ const char HTML_PAGE[] PROGMEM = R"=====(
   .btn-save:hover { background: rgba(34,197,94,0.2); }
   .btn-run { border-color: var(--accent); color: var(--accent); background: rgba(0,212,255,0.08); }
   .btn-run:hover { background: rgba(0,212,255,0.2); box-shadow: var(--glow); }
+  .btn-export { border-color: #a855f7; color: #a855f7; background: rgba(168,85,247,0.10); }
+  .btn-export:hover { background: rgba(168,85,247,0.22); box-shadow: 0 0 14px rgba(168,85,247,0.35); }
   .btn-run:disabled {
     opacity: 0.45;
     cursor: not-allowed;
@@ -635,6 +656,7 @@ const char HTML_PAGE[] PROGMEM = R"=====(
     <input type="text" id="presetName" placeholder="Enter preset name...">
     <button class="action-btn btn-save" onclick="saveCurrentPreset()">💾 Save Preset</button>
     <button class="action-btn btn-run" id="btnRun" onclick="runSequence()">▶ Run Sequence</button>
+    <button class="action-btn btn-export" onclick="exportSettingsJson()">📋 Export JSON</button>
     <div class="delay-control">
       <label>DELAY</label>
       <input type="range" id="delaySlider" min="200" max="2000" step="100" value="1000"
@@ -666,6 +688,7 @@ let joints = [];
 let presets = [];
 let seqPoll = null;
 let toastTimer = null;
+window.currentConfig = null;
 
 function fetchJson(url) {
   return fetch(url).then((r) => {
@@ -813,8 +836,10 @@ function buildPresetTable(currentIdx = -1, running = false) {
 function loadConfigAndRender() {
   fetchJson('/config')
     .then((data) => {
+      window.currentConfig = data;
       joints = (data.servos || []).map((s) => ({
         id: s.id,
+        channel: Number.isInteger(Number(s.channel)) ? Number(s.channel) : Number(s.id),
         name: s.name,
         icon: s.icon,
         sub: s.sub,
@@ -917,9 +942,105 @@ function setSequenceDelay(ms) {
     .then((r) => {
       if (!r.ok) throw new Error('Delay failed');
       updateDelayValue(delay);
+      if (window.currentConfig) window.currentConfig.sequenceDelayMs = delay;
       showToast(`Sequence delay → ${delay}ms`);
     })
     .catch(() => showToast('⚠ Delay update failed', true));
+}
+
+function buildExportSnapshot() {
+  const nowIso = new Date().toISOString();
+  const sequenceDelayEl = document.getElementById('delayValue');
+  const uiSequenceDelay = sequenceDelayEl ? parseInt(sequenceDelayEl.textContent, 10) : null;
+  const cfgSequenceDelay = Number(window.currentConfig?.sequenceDelayMs);
+  const exportSequenceDelay = Number.isInteger(cfgSequenceDelay)
+    ? cfgSequenceDelay
+    : (Number.isInteger(uiSequenceDelay) ? uiSequenceDelay : null);
+
+  return {
+    meta: {
+      exported_at: nowIso,
+      source: 'calibration-dashboard',
+      board: 'ESP32',
+      controller: 'PCA9685',
+      servo_count: joints.length
+    },
+    sequence: {
+      delay_ms: exportSequenceDelay,
+      running: Boolean(window.currentConfig?.sequenceRunning ?? (document.getElementById('btnRun')?.disabled === true)),
+      current_preset_index: Number.isInteger(Number(window.currentConfig?.currentPresetIndex))
+        ? Number(window.currentConfig.currentPresetIndex)
+        : (() => {
+            const runningRow = document.querySelector('#presetTableBody tr.preset-running');
+            return runningRow ? parseInt(runningRow.dataset.presetIdx || '-1', 10) : -1;
+          })()
+    },
+    hardware: {
+      pca_oe_pin: Number.isInteger(Number(window.currentConfig?.pcaOePin)) ? Number(window.currentConfig.pcaOePin) : null,
+      pca_output_enable_delay_ms: Number.isInteger(Number(window.currentConfig?.pcaOutputEnableDelayMs))
+        ? Number(window.currentConfig.pcaOutputEnableDelayMs)
+        : null
+    },
+    servos: joints.map((j) => ({
+      id: j.id,
+      name: j.name,
+      icon: j.icon,
+      subtitle: j.sub,
+      limits: {
+        min_angle: Number(j.min),
+        max_angle: Number(j.max),
+        home_angle: Number(j.home)
+      },
+      tuning: {
+        speed_deg_per_s: Number(j.speed),
+        ease_min_ms: Number(j.easeMin)
+      },
+      hardware: {
+        pca_channel: Number(j.channel)
+      },
+      current_angle: Number(j.val)
+    })),
+    presets: presets.map((p, idx) => ({
+      id: idx,
+      name: p.name,
+      angles: {
+        base: Number(p.angles?.[0] ?? 0),
+        shoulder: Number(p.angles?.[1] ?? 0),
+        elbow: Number(p.angles?.[2] ?? 0),
+        wrist: Number(p.angles?.[3] ?? 0),
+        gripper: Number(p.angles?.[4] ?? 0)
+      },
+      angles_array: Array.isArray(p.angles) ? p.angles.map((v) => Number(v)) : []
+    }))
+  };
+}
+
+async function exportSettingsJson() {
+  try {
+    const snapshot = buildExportSnapshot();
+    const jsonText = JSON.stringify(snapshot, null, 2);
+
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(jsonText);
+      showToast('Exported settings JSON to clipboard');
+      return;
+    }
+
+    const ta = document.createElement('textarea');
+    ta.value = jsonText;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+
+    if (!ok) throw new Error('copy-failed');
+    showToast('Exported settings JSON to clipboard');
+  } catch (e) {
+    showToast('⚠ Clipboard copy failed', true);
+  }
 }
 
 function gotoPreset(idx) {
@@ -950,6 +1071,11 @@ function saveCurrentPreset() {
     })
     .then((data) => {
       presets = data.presets || [];
+      if (window.currentConfig) {
+        window.currentConfig.presets = presets;
+        window.currentConfig.currentPresetIndex = data.currentPresetIndex ?? -1;
+        window.currentConfig.sequenceRunning = Boolean(data.sequenceRunning);
+      }
       buildPresetTable(data.currentPresetIndex ?? -1, Boolean(data.sequenceRunning));
       nameEl.value = '';
       showToast(`Saved: ${name}`);
@@ -971,6 +1097,11 @@ function overwritePreset(idx) {
     })
     .then((data) => {
       presets = data.presets || [];
+      if (window.currentConfig) {
+        window.currentConfig.presets = presets;
+        window.currentConfig.currentPresetIndex = data.currentPresetIndex ?? -1;
+        window.currentConfig.sequenceRunning = Boolean(data.sequenceRunning);
+      }
       buildPresetTable(data.currentPresetIndex ?? -1, Boolean(data.sequenceRunning));
       showToast(`Updated preset ${idx}`);
     })
@@ -988,6 +1119,11 @@ function deletePreset(idx) {
     })
     .then((data) => {
       presets = data.presets || [];
+      if (window.currentConfig) {
+        window.currentConfig.presets = presets;
+        window.currentConfig.currentPresetIndex = data.currentPresetIndex ?? -1;
+        window.currentConfig.sequenceRunning = Boolean(data.sequenceRunning);
+      }
       buildPresetTable(data.currentPresetIndex ?? -1, Boolean(data.sequenceRunning));
       showToast(`Deleted preset ${idx}`);
     })
@@ -1015,6 +1151,11 @@ function pollStatus() {
       const running = Boolean(s.busy);
       setSeqRunning(running);
       updateRunningRow(s.current_preset, running);
+
+      if (window.currentConfig) {
+        window.currentConfig.currentPresetIndex = s.current_preset;
+        window.currentConfig.sequenceRunning = running;
+      }
 
       if (Array.isArray(s.angles)) {
         s.angles.forEach((a, i) => {
@@ -1076,17 +1217,31 @@ loadConfigAndRender();
 void setup() {
   Serial.begin(115200);
 
+  // Optional: keep PWM outputs disabled during boot init to reduce startup twitch.
+  if (PCA_OE_PIN >= 0) {
+    pinMode(PCA_OE_PIN, OUTPUT);
+    setPcaOutputsEnabled(false); // disable outputs (OE HIGH)
+    Serial.printf("[INIT] PCA outputs disabled on OE pin GPIO %d\n", PCA_OE_PIN);
+  }
+
   pca.begin();
   pca.setOscillatorFrequency(OSC_FREQ);
   pca.setPWMFreq(PWM_FREQ_HZ);
   delay(10);
 
-  // Sync to home angles
+  // Sync to home angles while outputs are disabled (if OE wired)
   for (int i = 0; i < NUM_SERVOS; i++) {
     writeServoNow(i, servos[i].homeAngle);
     targetAngles[i] = servos[i].homeAngle;
   }
   delay(120);
+
+  // Re-enable outputs only after valid startup targets are loaded.
+  if (PCA_OE_PIN >= 0) {
+    delay(PCA_OUTPUT_ENABLE_DELAY_MS);
+    setPcaOutputsEnabled(true); // enable outputs (OE LOW)
+    Serial.println("[INIT] PCA outputs enabled.");
+  }
 
   // STA WiFi
   Serial.println("\n[NET] Connecting to WiFi...");
