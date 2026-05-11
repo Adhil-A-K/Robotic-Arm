@@ -359,18 +359,26 @@ const char HTML_PAGE[] PROGMEM = R"=====(
     padding-bottom: 6px;
     border-bottom: 1px solid var(--border);
   }
-
   .grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-    gap: 16px; max-width: 1100px; margin: 0 auto 24px;
+    gap: 16px; 
+    max-width: 1100px; 
+    margin: 0 auto 24px;
+    min-height: 200px; /* Ensure grid has minimum height */
+    border: 2px solid red; /* DEBUG: make grid visible */
   }
+  
   .card {
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 12px; padding: 22px;
-    position: relative; overflow: hidden;
+    border-radius: 12px; 
+    padding: 22px;
+    position: relative;
+    overflow: hidden;
     transition: border-color 0.3s, box-shadow 0.3s;
+    min-height: 300px; /* Ensure cards have minimum height */
+    border: 2px solid blue; /* DEBUG: make cards visible */
   }
   .card::before {
     content: ''; position: absolute;
