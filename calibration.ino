@@ -612,7 +612,7 @@ fetch('/config')
   .then(r => {
     console.log('Config fetch response status:', r.status);
     return r.json();
-  });
+  })
   .then(data => {
     console.log('Config data received:', data);
     joints = data.servos.map(s => ({
