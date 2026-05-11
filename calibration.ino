@@ -92,7 +92,8 @@ Preset presets[MAX_PRESETS];
 int presetCount = 0;
 bool sequenceRunning = false;
 int currentPresetIndex = 0;
-unsigned long sequenceDelayMs = 500; // delay between presets
+  // Sequence execution delay (ms) — adjustable via UI
+  int sequenceDelayMs = 1000;
 
 // ── Web Server ────────────────────────────────────────────────
 AsyncWebServer server(80);
@@ -274,7 +275,8 @@ String buildConfigJson() {
     if (p < presetCount - 1) json += ",";
   }
   json += "],\"sequenceRunning\":" + String(sequenceRunning ? "true" : "false") + 
-         ",\"sequenceDelayMs\":" + String(sequenceDelayMs) + "}";
+  json += "\"sequenceDelayMs\":" + String(sequenceDelayMs) + ",";
+  json += "\"currentPresetIndex\":" + String(currentPresetIndex);
   return json;
 }
 
@@ -463,16 +465,34 @@ const char HTML_PAGE[] PROGMEM = R"=====(
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 14px; padding: 24px;
-  }
+  // Add delay control to preset controls
   .preset-controls {
     display: flex; gap: 12px; margin-bottom: 16px;
     align-items: center;
+    flex-wrap: wrap;
   }
+  
   #presetName {
-    flex: 1; padding: 8px 12px;
+    flex: 1; min-width: 200px;
+    padding: 8px 12px;
     background: rgba(0,212,255,0.05); border: 1px solid rgba(0,212,255,0.2);
     border-radius: 8px; color: var(--accent);
     font-family: 'Share Tech Mono', monospace; font-size: 0.8rem;
+  }
+  
+  .delay-control {
+    display: flex; align-items: center; gap: 8px;
+    font-family: 'Share Tech Mono', monospace; font-size: 0.7rem;
+    color: var(--dim);
+  }
+  
+  #delaySlider {
+    width: 120px;
+  }
+  
+  .delay-value {
+    min-width: 40px; text-align: right;
+    color: var(--accent);
   }
   #presetName:focus { outline: none; border-color: var(--accent); }
 
@@ -491,13 +511,25 @@ const char HTML_PAGE[] PROGMEM = R"=====(
   td {
     padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,0.05);
   }
-  tr:hover { background: rgba(0,212,255,0.03); }
-  .btn-table {
-    padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border);
-    background: transparent; color: var(--dim);
-    font-size: 0.6rem; cursor: pointer; transition: all 0.2s;
+  // Add running indicator styles
+  .preset-running {
+    background: rgba(34,197,94,0.15);
+    border-left: 3px solid var(--green);
   }
-  .btn-table:hover { border-color: var(--accent); color: var(--accent); }
+  
+  .preset-id {
+    font-family: 'Share Tech Mono', monospace;
+    font-weight: bold;
+    transition: color 0.2s;
+  }
+  
+  .preset-id.running {
+    color: var(--green);
+  }
+  
+  .preset-id.idle {
+    color: var(--dim);
+  }
   .btn-delete:hover { border-color: #ef4444; color: #ef4444; }
 
   .toast {
@@ -531,10 +563,17 @@ const char HTML_PAGE[] PROGMEM = R"=====(
 <!-- ── Preset Sequencing ───────────────────────────────────── -->
 <div class="section-title">📍 Preset Sequencing</div>
 <div class="preset-table-container">
+  // Add delay control to preset controls
   <div class="preset-controls">
     <input type="text" id="presetName" placeholder="Enter preset name...">
     <button class="action-btn btn-save" onclick="saveCurrentPreset()">💾 Save Preset</button>
     <button class="action-btn btn-run" id="btnRun" onclick="runSequence()">▶ Run Sequence</button>
+    <div class="delay-control">
+      <label>DELAY</label>
+      <input type="range" id="delaySlider" min="200" max="2000" step="100" value="1000"
+             oninput="updateDelayValue(this.value)" onchange="setSequenceDelay(this.value)">
+      <span class="delay-value" id="delayValue">1000</span>ms
+    </div>
   </div>
   <div class="table-wrapper">
     <table id="presetTable">
@@ -658,36 +697,74 @@ function updateServoEase(id) {
   if (ease >= 50 && ease <= 500) {
     fetch(`/set_ease?id=${id}&ease=${ease}`)
       .then(() => showToast(`${joints[id].name} ease → ${ease}ms`))
-      .catch(() => showToast('⚠ Connection error', true));
+  // Add Go To preset function
+  function gotoPreset(idx) {
+    const angles = presets[idx].angles;
+    joints.forEach((j, i) => {
+      document.getElementById(`sl${i}`).value = angles[i];
+      onSlide(i, angles[i]);
+      j.val = angles[i];
+    });
+    
+    // Send all angles to firmware
+    const promises = angles.map((a, i) => 
+      fetch(`/set?ch=${i}&angle=${a}`).catch(() => {})
+    );
+    
+    Promise.all(promises).then(() => 
+      showToast(`Moved to preset: ${presets[idx].name}`)
+    );
   }
-}
-
-// ── Preset Table ─────────────────────────────────────────────
-function buildPresetTable() {
-  const tbody = document.getElementById('presetTableBody');
-  tbody.innerHTML = '';
   
-  if (presets.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--dim)">No presets saved yet</td></tr>';
-    return;
+  // Add delay control functions
+  function updateDelayValue(val) {
+    document.getElementById('delayValue').textContent = val;
   }
   
-  presets.forEach((p, idx) => {
-    const row = document.createElement('tr');
-    row.innerHTML = `
-      <td>${idx}</td>
-      <td>${p.name}</td>
-      <td>${formatAngles(p.angles)}</td>
-      <td>
-        <button class="btn-table" onclick="overwritePreset(${idx})">💾 Save</button>
-        <button class="btn-table btn-delete" onclick="deletePreset(${idx})">🗑 Delete</button>
-      </td>
-    `;
-    tbody.appendChild(row);
-  });
-}
-
-function formatAngles(angles) {
+  function setSequenceDelay(ms) {
+    fetch(`/set_delay?ms=${ms}`)
+      .then(() => showToast(`Sequence delay → ${ms}ms`))
+      .catch(() => showToast('⚠ Delay update failed', true));
+  }
+  
+  // Update buildPresetTable to use config data
+  function buildPresetTable() {
+    fetch('/config')
+      .then(r => r.json())
+      .then(data => {
+        presets = data.presets;
+        const tbody = document.getElementById('presetTableBody');
+        tbody.innerHTML = '';
+        
+        if (presets.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--dim)">No presets saved yet</td></tr>';
+          return;
+        }
+        
+        // Add Go To button and running indicator to table rows
+        presets.forEach((p, idx) => {
+          const row = document.createElement('tr');
+          row.id = `preset-row-${idx}`;
+          row.className = (idx === data.currentPresetIndex && data.sequenceRunning) ? 'preset-running' : '';
+          
+          const isRunning = (idx === data.currentPresetIndex && data.sequenceRunning);
+          const idClass = isRunning ? 'preset-id running' : 'preset-id idle';
+          
+          row.innerHTML = `
+            <td class="${idClass}">${idx}</td>
+            <td>${p.name}</td>
+            <td>${formatAngles(p.angles)}</td>
+            <td>
+              <button class="btn-table" onclick="gotoPreset(${idx})">▶ Go To</button>
+              <button class="btn-table" onclick="overwritePreset(${idx})">💾 Save</button>
+              <button class="btn-table btn-delete" onclick="deletePreset(${idx})">🗑 Delete</button>
+            </td>
+          `;
+          tbody.appendChild(row);
+        });
+      })
+      .catch(() => showToast('⚠ Failed to refresh presets', true));
+  }
   const names = ['Base', 'Shoulder', 'Elbow', 'Wrist', 'Gripper'];
   return angles.map((a, i) => `${names[i]}:${a}°`).join(' | ');
 }
@@ -934,6 +1011,33 @@ void setup() {
     req->send(400, "text/plain", "Bad Request");
   });
 
+  // Add endpoint to set sequence delay
+  server.on("/set_delay", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (req->hasParam("ms")) {
+      int ms = req->getParam("ms")->value().toInt();
+      if (ms >= 200 && ms <= 2000) {
+        sequenceDelayMs = ms;
+        req->send(200, "text/plain", "OK");
+        return;
+      }
+    }
+    req->send(400, "text/plain", "Bad Request");
+  });
+  
+  // Add endpoint to go to a specific preset
+  server.on("/goto_preset", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (req->hasParam("id")) {
+      int id = req->getParam("id")->value().toInt();
+      if (id >= 0 && id < presetCount) {
+        setAllAngles(presets[id].angles);
+        req->send(200, "text/plain", "OK");
+        return;
+      }
+    }
+    req->send(400, "text/plain", "Bad Request");
+  });
+
+  // Add endpoint to run sequence
   server.on("/run_sequence", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (presetCount == 0) {
       req->send(200, "text/plain", "No presets");
@@ -942,7 +1046,7 @@ void setup() {
     startSequence();
     req->send(200, "text/plain", "OK");
   });
-
+  
   server.begin();
   Serial.println("Web server started.");
   lastStepMs = millis();
