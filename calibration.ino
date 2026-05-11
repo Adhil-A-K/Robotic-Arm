@@ -606,69 +606,94 @@ const char HTML_PAGE[] PROGMEM = R"=====(
 let joints = [];
 let presets = [];
 let seqPoll = null;
-
+// Load config (joints + presets)
+console.log('Starting config fetch...');
 fetch('/config')
-  .then(r => r.json())
+  .then(r => {
+    console.log('Config fetch response status:', r.status);
+    return r.json();
+  })
   .then(data => {
+    console.log('Config data received:', data);
     joints = data.servos.map(s => ({
       id: s.id, name: s.name, icon: s.icon, sub: s.sub,
       min: s.min, max: s.max, home: s.home, val: s.current,
       speed: s.speed, easeMin: s.easeMin
     }));
     presets = data.presets;
+    console.log('Joints parsed:', joints.length);
+    console.log('Presets parsed:', presets.length);
+    
     buildServoUI();
     buildPresetTable();
     if (data.sequenceRunning) setSeqRunning(true);
     if (!seqPoll) seqPoll = setInterval(pollStatus, 500);
   })
-  .catch(() => {
+  .catch(error => {
+    console.error('Failed to load config:', error);
     document.getElementById('loading').textContent = '⚠ Failed to load config';
   });
 
 // ── Servo UI ─────────────────────────────────────────────────
 function buildServoUI() {
-  const grid = document.getElementById('servoGrid');
-  grid.innerHTML = '';
-  joints.forEach(j => {
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.innerHTML = `
-      <div class="card-header">
-        <div class="joint-label">
-          <div class="joint-icon">${j.icon}</div>
-          <div>
-            <div class="joint-name">${j.name}</div>
-            <div class="joint-sub">${j.sub}</div>
+  console.log('buildServoUI() called');
+  try {
+    const grid = document.getElementById('servoGrid');
+    if (!grid) {
+      console.error('servoGrid element not found');
+      return;
+    }
+    console.log('Found servoGrid:', grid);
+    
+    grid.innerHTML = '';
+    console.log('Cleared grid, joints count:', joints.length);
+    
+    joints.forEach((j, index) => {
+      console.log('Creating card for joint', index, j.name);
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `
+        <div class="card-header">
+          <div class="joint-label">
+            <div class="joint-icon">${j.icon}</div>
+            <div>
+              <div class="joint-name">${j.name}</div>
+              <div class="joint-sub">${j.sub}</div>
+            </div>
           </div>
+          <div class="angle-display" id="disp${j.id}">${j.val}°</div>
         </div>
-        <div class="angle-display" id="disp${j.id}">${j.val}°</div>
-      </div>
-      
-      <div class="input-row">
-        <label>MIN</label>
-        <input type="number" id="min${j.id}" value="${j.min}" 
-               onchange="updateServoLimits(${j.id})" min="0" max="180">
-        <label>MAX</label>
-        <input type="number" id="max${j.id}" value="${j.max}" 
-               onchange="updateServoLimits(${j.id})" min="0" max="180">
-      </div>
-      
-      <div class="input-row">
-        <label>SPEED</label>
-        <input type="number" id="speed${j.id}" value="${j.speed}" 
-               onchange="updateServoSpeed(${j.id})" min="10" max="200">
-        <label>EASE</label>
-        <input type="number" id="ease${j.id}" value="${j.easeMin}" 
-               onchange="updateServoEase(${j.id})" min="50" max="500">
-      </div>
-      
-      <input type="range" id="sl${j.id}" min="${j.min}" max="${j.max}" value="${j.val}"
-        oninput="onSlide(${j.id}, this.value)"
-        onchange="sendAngle(${j.id}, this.value)">
-      <div class="range-labels"><span>${j.min}°</span><span>${j.max}°</span></div>
-    `;
-    grid.appendChild(card);
-  });
+        
+        <div class="input-row">
+          <label>MIN</label>
+          <input type="number" id="min${j.id}" value="${j.min}" 
+                 onchange="updateServoLimits(${j.id})" min="0" max="180">
+          <label>MAX</label>
+          <input type="number" id="max${j.id}" value="${j.max}" 
+                 onchange="updateServoLimits(${j.id})" min="0" max="180">
+        </div>
+        
+        <div class="input-row">
+          <label>SPEED</label>
+          <input type="number" id="speed${j.id}" value="${j.speed}" 
+                 onchange="updateServoSpeed(${j.id})" min="10" max="200">
+          <label>EASE</label>
+          <input type="number" id="ease${j.id}" value="${j.easeMin}" 
+                 onchange="updateServoEase(${j.id})" min="50" max="500">
+        </div>
+        
+        <input type="range" id="sl${j.id}" min="${j.min}" max="${j.max}" value="${j.val}"
+          oninput="onSlide(${j.id}, this.value)"
+          onchange="sendAngle(${j.id}, this.value)">
+        <div class="range-labels"><span>${j.min}°</span><span>${j.max}°</span></div>
+      `;
+      grid.appendChild(card);
+      console.log('Added card for', j.name);
+    });
+    console.log('buildServoUI() completed successfully');
+  } catch (error) {
+    console.error('Error in buildServoUI:', error);
+  }
 }
 
 function updateServoLimits(id) {
