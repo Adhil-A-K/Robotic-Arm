@@ -99,10 +99,10 @@ Adafruit_PWMServoDriver pca = Adafruit_PWMServoDriver(0x40);
 #define ON   LOW
 #define OFF  HIGH
 
-// Main motor power relay polarity (active-LOW on current hardware)
-// If your relay module is active-HIGH, swap these two values.
-#define MAIN_RELAY_ACTIVE_LEVEL    LOW
-#define MAIN_RELAY_INACTIVE_LEVEL  HIGH
+// Main motor power relay polarity aligned to obstacle_avoidance.ino
+// obstacle_avoidance.ino uses: ON=HIGH, OFF=LOW
+#define MAIN_RELAY_ACTIVE_LEVEL    HIGH
+#define MAIN_RELAY_INACTIVE_LEVEL  LOW
 
 // ── Servo Config ──────────────────────────────────────────────
 struct ServoConfig {
@@ -447,7 +447,9 @@ long readDistance(int trigPin, int echoPin) {
 void setWheelsEnabled(bool enabled) {
   wheelsEnabled = enabled;
   if (!wheelsEnabled) {
+    // Smooth stop behavior aligned with obstacle_avoidance.ino
     stopMotors();
+    delay(smoothDelay);
     autoResumeWheelsAfterSeq = false;
     Serial.printf("[WHEELS] Disabled -> MAIN_RELAY set to OFF level (%d)\n", MAIN_RELAY_INACTIVE_LEVEL);
   } else {
@@ -527,7 +529,9 @@ bool startManagedSequence(int obj, const char* source) {
 
   // If wheels are enabled, always stop wheels before arm sequence.
   if (wheelsEnabled) {
+    // Keep smooth stop timing from obstacle_avoidance.ino
     stopMotors();
+    delay(smoothDelay);
     autoResumeWheelsAfterSeq = true;
   } else {
     autoResumeWheelsAfterSeq = false;
