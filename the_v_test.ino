@@ -163,12 +163,12 @@ struct Preset {
 Preset presets[4] = {
   { "pickup1", "Paper — Pickup",   { 100,  37,  49, 161, GRIPPER_OPEN } },
   { "pickup2", "Plastic — Pickup", { 100,  37,  49, 161, GRIPPER_OPEN } },
-  { "drop1",   "Paper — Drop",     {  69, 110, 180, 175, GRIPPER_OPEN } },
-  { "drop2",   "Plastic — Drop",   { 125, 110, 180, 175, GRIPPER_OPEN } },
+  { "drop1",   "Paper — Drop",     {  73, 110, 180, 175, GRIPPER_OPEN } },
+  { "drop2",   "Plastic — Drop",   { 110, 110, 180, 175, GRIPPER_OPEN } },
 };
 
 // Safe transit height (arm raised safely before moving between positions)
-int transitAngles[NUM_SERVOS] = { 95, 160, 20, 60, GRIPPER_OPEN };
+int transitAngles[NUM_SERVOS] = { 95, 160, 47, 177, GRIPPER_OPEN };
 
 // ── Runtime State ─────────────────────────────────────────────
 int currentAngles[NUM_SERVOS] = { 0, 0, 0, 0, 0 };
