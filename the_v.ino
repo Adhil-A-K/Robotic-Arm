@@ -197,6 +197,14 @@ bool wheelsEnabled = false;          // default OFF at boot
 bool appInputEnabled = true;         // default ON at boot
 bool autoResumeWheelsAfterSeq = false;
 
+// Servo power policy via PCA9685 OE (OE HIGH=outputs disabled, OE LOW=enabled)
+bool servoOutputsEnabled = true;
+bool oeManualMode = false;           // false=auto policy, true=manual override
+bool oeManualTargetEnabled = true;   // used when oeManualMode=true
+unsigned long servoActiveHoldUntilMs = 0;
+String oeLastReason = "init";
+#define SERVO_OE_ACTIVITY_HOLD_MS 1500
+
 // Last obstacle sensor snapshots (for status telemetry)
 long lastLeftDistanceCm = 999;
 long lastRightDistanceCm = 999;
@@ -245,9 +253,33 @@ void writeServoNow(int ch, int angle) {
 }
 
 void setPcaOutputsEnabled(bool enable) {
+  servoOutputsEnabled = enable;
   if (PCA_OE_PIN < 0) return;
   // OE active-high: HIGH disables outputs, LOW enables outputs.
   digitalWrite(PCA_OE_PIN, enable ? LOW : HIGH);
+}
+
+void requestServoActive(const char* reason) {
+  servoActiveHoldUntilMs = millis() + SERVO_OE_ACTIVITY_HOLD_MS;
+  oeLastReason = reason;
+  if (oeManualMode) return;
+  setPcaOutputsEnabled(true);
+}
+
+void applyServoOePolicy() {
+  bool desiredEnabled = servoOutputsEnabled;
+
+  if (oeManualMode) {
+    desiredEnabled = oeManualTargetEnabled;
+  } else {
+    bool armActive = seqRunning || !allAtTarget() || (millis() < servoActiveHoldUntilMs);
+    desiredEnabled = armActive;
+  }
+
+  if (desiredEnabled != servoOutputsEnabled) {
+    setPcaOutputsEnabled(desiredEnabled);
+    oeLastReason = desiredEnabled ? "auto-active" : "auto-idle";
+  }
 }
 
 void setServoAngle(int ch, int angle) {
@@ -255,6 +287,8 @@ void setServoAngle(int ch, int angle) {
 
   // If nothing changes, avoid restarting easing profile.
   if (clamped == targetAngles[ch]) return;
+
+  requestServoActive("set-angle");
 
   int start = currentAngles[ch];
   targetAngles[ch] = clamped;
@@ -673,6 +707,7 @@ void runSequence() {
         safeForward();
       }
       autoResumeWheelsAfterSeq = false;
+      requestServoActive("seq-done");
       break;
   }
 }
@@ -705,7 +740,9 @@ String buildConfigJson() {
   }
   json += "],\"seqRunning\":" + String(seqRunning ? "true" : "false");
   json += ",\"wheelsEnabled\":" + String(wheelsEnabled ? "true" : "false");
-  json += ",\"appInputEnabled\":" + String(appInputEnabled ? "true" : "false") + "}";
+  json += ",\"appInputEnabled\":" + String(appInputEnabled ? "true" : "false");
+  json += ",\"oeManualMode\":" + String(oeManualMode ? "true" : "false");
+  json += ",\"oeEnabled\":" + String(servoOutputsEnabled ? "true" : "false") + "}";
   return json;
 }
 
@@ -732,6 +769,9 @@ String buildStatusJson() {
   json += "\"task\":\"" + label + "\",";
   json += "\"wheels_enabled\":" + String(wheelsEnabled ? "true" : "false") + ",";
   json += "\"app_input_enabled\":" + String(appInputEnabled ? "true" : "false") + ",";
+  json += "\"oe_manual_mode\":" + String(oeManualMode ? "true" : "false") + ",";
+  json += "\"oe_enabled\":" + String(servoOutputsEnabled ? "true" : "false") + ",";
+  json += "\"oe_pin_level\":" + String((PCA_OE_PIN >= 0) ? digitalRead(PCA_OE_PIN) : -1) + ",";
   json += "\"left_distance_cm\":" + String(lastLeftDistanceCm) + ",";
   json += "\"right_distance_cm\":" + String(lastRightDistanceCm) + ",";
   json += "\"last_detected_type\":" + String(lastDetectedType) + ",";
@@ -1121,8 +1161,11 @@ const char HTML_PAGE[] PROGMEM = R"=====(
   <div class="mode-buttons">
     <button class="mode-btn mode-off" id="btnWheelsToggle" onclick="toggleWheels()">🛞 Wheels: OFF</button>
     <button class="mode-btn mode-on" id="btnAppInputToggle" onclick="toggleAppInput()">📲 App Detection Input: ON</button>
+    <button class="mode-btn mode-off" id="btnOeModeToggle" onclick="toggleOeMode()">🧠 Servo OE Mode: AUTO</button>
+    <button class="mode-btn mode-on" id="btnOeOutputToggle" onclick="toggleOeOutput()">🔌 Servo OE Output: ENABLED</button>
   </div>
   <div class="mode-note" id="modeNote">When Wheels are ON, obstacle avoidance drives until a Paper/Plastic sequence is triggered.</div>
+  <div class="mode-note" id="oeNote">Servo OE AUTO mode active.</div>
 </div>
 
 <!-- ── Pick & Drop ──────────────────────────────────────────── -->
@@ -1174,6 +1217,8 @@ let presets = [];
 let seqPoll = null;
 let wheelsEnabled = false;
 let appInputEnabled = true;
+let oeManualMode = false;
+let oeEnabled = true;
 
 // Load config (joints + presets)
 fetch('/config')
@@ -1187,6 +1232,8 @@ fetch('/config')
     presets = data.presets;
     wheelsEnabled = !!data.wheelsEnabled;
     appInputEnabled = (data.appInputEnabled !== undefined) ? !!data.appInputEnabled : true;
+    oeManualMode = (data.oeManualMode !== undefined) ? !!data.oeManualMode : false;
+    oeEnabled = (data.oeEnabled !== undefined) ? !!data.oeEnabled : true;
     renderModeButtons();
     buildServoUI();
     buildPresetUI();
@@ -1201,8 +1248,11 @@ fetch('/config')
 function renderModeButtons() {
   const wb = document.getElementById("btnWheelsToggle");
   const ab = document.getElementById("btnAppInputToggle");
+  const om = document.getElementById("btnOeModeToggle");
+  const oo = document.getElementById("btnOeOutputToggle");
   const note = document.getElementById("modeNote");
-  if (!wb || !ab || !note) return;
+  const oeNote = document.getElementById("oeNote");
+  if (!wb || !ab || !om || !oo || !note || !oeNote) return;
 
   wb.textContent = wheelsEnabled ? "🛞 Wheels: ON" : "🛞 Wheels: OFF";
   wb.classList.toggle("mode-on", wheelsEnabled);
@@ -1212,9 +1262,21 @@ function renderModeButtons() {
   ab.classList.toggle("mode-on", appInputEnabled);
   ab.classList.toggle("mode-off", !appInputEnabled);
 
+  om.textContent = oeManualMode ? "🧠 Servo OE Mode: MANUAL" : "🧠 Servo OE Mode: AUTO";
+  om.classList.toggle("mode-on", oeManualMode);
+  om.classList.toggle("mode-off", !oeManualMode);
+
+  oo.textContent = oeEnabled ? "🔌 Servo OE Output: ENABLED" : "🔌 Servo OE Output: DISABLED";
+  oo.classList.toggle("mode-on", oeEnabled);
+  oo.classList.toggle("mode-off", !oeEnabled);
+
   note.textContent = wheelsEnabled
     ? "Wheels ON: obstacle avoidance active. Sequences pause wheels, then resume after drop."
     : "Wheels OFF: motor relay is OFF. Arm can still be controlled from dashboard.";
+
+  oeNote.textContent = oeManualMode
+    ? "Servo OE MANUAL mode active (dashboard override)."
+    : "Servo OE AUTO mode: enabled only while arm is active, disabled when idle.";
 }
 
 function toggleWheels() {
@@ -1242,6 +1304,32 @@ function toggleAppInput() {
       showToast(appInputEnabled ? "App detection input enabled" : "App detection input disabled");
     })
     .catch(() => showToast("⚠ App input toggle failed", true));
+}
+
+function toggleOeMode() {
+  const next = oeManualMode ? 0 : 1;
+  fetch(`/set_oe_manual?enabled=${next}`)
+    .then(r => r.json())
+    .then(s => {
+      oeManualMode = !!s.oe_manual_mode;
+      oeEnabled = !!s.oe_enabled;
+      renderModeButtons();
+      showToast(oeManualMode ? "Servo OE manual mode enabled" : "Servo OE auto mode enabled");
+    })
+    .catch(() => showToast("⚠ OE mode toggle failed", true));
+}
+
+function toggleOeOutput() {
+  const next = oeEnabled ? 0 : 1;
+  fetch(`/set_oe_output?enabled=${next}`)
+    .then(r => r.json())
+    .then(s => {
+      oeManualMode = !!s.oe_manual_mode;
+      oeEnabled = !!s.oe_enabled;
+      renderModeButtons();
+      showToast(oeEnabled ? "Servo OE enabled (OE LOW)" : "Servo OE disabled (OE HIGH)");
+    })
+    .catch(() => showToast("⚠ OE output toggle failed", true));
 }
 
 // ── Servo UI ─────────────────────────────────────────────────
@@ -1378,6 +1466,8 @@ function pollSeqStatus() {
     .then(s => {
       if (typeof s.wheels_enabled === "boolean") wheelsEnabled = s.wheels_enabled;
       if (typeof s.app_input_enabled === "boolean") appInputEnabled = s.app_input_enabled;
+      if (typeof s.oe_manual_mode === "boolean") oeManualMode = s.oe_manual_mode;
+      if (typeof s.oe_enabled === "boolean") oeEnabled = s.oe_enabled;
       renderModeButtons();
       if (!s.busy) setSeqRunning(false);
       document.getElementById('seqStatus').textContent =
@@ -1510,6 +1600,11 @@ void setup() {
     Serial.println("[INIT] PCA outputs enabled.");
   }
 
+  // Start in AUTO OE policy and allow brief hold after boot positioning.
+  oeManualMode = false;
+  oeManualTargetEnabled = true;
+  requestServoActive("boot-init");
+
   Serial.println("[INIT] Ready.");
 
   // Network init (friend-style): AP always ON + optional STA
@@ -1593,6 +1688,51 @@ void setup() {
     req->send(200, "application/json", json);
   });
 
+  // /set_oe_manual?enabled=0|1
+  server.on("/set_oe_manual", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!req->hasParam("enabled")) {
+      req->send(400, "application/json", "{\"error\":\"Missing enabled param\"}");
+      return;
+    }
+    int e = req->getParam("enabled")->value().toInt();
+    oeManualMode = (e == 1);
+    if (oeManualMode) {
+      oeManualTargetEnabled = servoOutputsEnabled; // keep current OE state when entering manual
+    } else {
+      requestServoActive("manual-to-auto");
+    }
+    applyServoOePolicy();
+
+    String json = "{";
+    json += "\"ok\":true,";
+    json += "\"oe_manual_mode\":" + String(oeManualMode ? "true" : "false") + ",";
+    json += "\"oe_enabled\":" + String(servoOutputsEnabled ? "true" : "false") + ",";
+    json += "\"oe_pin_level\":" + String((PCA_OE_PIN >= 0) ? digitalRead(PCA_OE_PIN) : -1);
+    json += "}";
+    req->send(200, "application/json", json);
+  });
+
+  // /set_oe_output?enabled=0|1
+  server.on("/set_oe_output", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!req->hasParam("enabled")) {
+      req->send(400, "application/json", "{\"error\":\"Missing enabled param\"}");
+      return;
+    }
+    int e = req->getParam("enabled")->value().toInt();
+    oeManualMode = true;
+    oeManualTargetEnabled = (e == 1);
+    oeLastReason = oeManualTargetEnabled ? "manual-enable" : "manual-disable";
+    setPcaOutputsEnabled(oeManualTargetEnabled);
+
+    String json = "{";
+    json += "\"ok\":true,";
+    json += "\"oe_manual_mode\":true,";
+    json += "\"oe_enabled\":" + String(servoOutputsEnabled ? "true" : "false") + ",";
+    json += "\"oe_pin_level\":" + String((PCA_OE_PIN >= 0) ? digitalRead(PCA_OE_PIN) : -1);
+    json += "}";
+    req->send(200, "application/json", json);
+  });
+
   // /ping — app-side health check
   server.on("/ping", HTTP_GET, [](AsyncWebServerRequest* req) {
     String json = "{";
@@ -1601,6 +1741,8 @@ void setup() {
     json += "\"busy\":" + String(seqRunning ? "true" : "false") + ",";
     json += "\"wheels_enabled\":" + String(wheelsEnabled ? "true" : "false") + ",";
     json += "\"app_input_enabled\":" + String(appInputEnabled ? "true" : "false") + ",";
+    json += "\"oe_manual_mode\":" + String(oeManualMode ? "true" : "false") + ",";
+    json += "\"oe_enabled\":" + String(servoOutputsEnabled ? "true" : "false") + ",";
     json += "\"ap_ssid\":\"" + String(AP_SSID) + "\",";
     json += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
     json += "\"ap_clients\":" + String(WiFi.softAPgetStationNum()) + ",";
@@ -1787,5 +1929,6 @@ void loop() {
   updateServos();
   runSequence();
   runObstacleAvoidance();
+  applyServoOePolicy();
 }
 
