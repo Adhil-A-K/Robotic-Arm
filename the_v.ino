@@ -1,0 +1,1787 @@
+/*
+  ============================================================
+  Robotic Arm Controller — ESP32 + PCA9685 + Web Dashboard
+  v3.0 — Presets + Pick-and-Drop sequences
+  ============================================================
+  Libraries required (install via Arduino Library Manager):
+    - Adafruit PWM Servo Driver Library  (Adafruit)
+    - ESPAsyncWebServer                  (me-no-dev)
+    - AsyncTCP                           (me-no-dev)
+
+  PCA9685 Wiring:
+    ESP32 SDA  → PCA9685 SDA  (GPIO 21)
+    ESP32 SCL  → PCA9685 SCL  (GPIO 22)
+    ESP32 3.3V → PCA9685 VCC
+    ESP32 GND  → PCA9685 GND
+    External 5V/6V Power Supply → PCA9685 V+  (servo power)
+    External GND               → PCA9685 GND  (common ground with ESP32)
+
+  Servo Channels on PCA9685:
+    Channel 0 → Base Rotation
+    Channel 1 → Shoulder
+    Channel 2 → Elbow
+    Channel 3 → Wrist
+    Channel 4 → Gripper
+  ============================================================
+*/
+
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
+
+// ── Network Mode (friend-style AP + optional STA) ───────────
+// AP is always ON so the app has a stable fallback endpoint.
+static const char *AP_SSID     = "WasteBin_AP";
+static const char *AP_PASSWORD = "12345678";
+
+// Optional: also connect ESP32 to router while AP stays active.
+static const bool   ENABLE_STA   = true;
+static const char *STA_SSID      = "Motridox";
+static const char *STA_PASSWORD  = "Bassim@8371";
+
+// Fixed AP IP (stable for app): http://192.168.4.1
+static const IPAddress AP_LOCAL_IP(192, 168, 4, 1);
+static const IPAddress AP_GATEWAY(192, 168, 4, 1);
+static const IPAddress AP_SUBNET(255, 255, 255, 0);
+
+// ── Boot movement mitigation (optional hardware assist) ──────
+// If you wire PCA9685 OE pin to an ESP32 GPIO, boot twitch can be minimized:
+// - Keep outputs disabled during init
+// - Program startup angles
+// - Then enable outputs
+// PCA9685 OE is ACTIVE-HIGH (HIGH=disabled, LOW=enabled).
+// Set to -1 if OE is not wired.
+static const int PCA_OE_PIN = 27;
+#define PCA_OUTPUT_ENABLE_DELAY_MS  80
+
+// PCA9685 I2C pins on ESP32
+static const int PCA_SDA_PIN = 21;
+static const int PCA_SCL_PIN = 22;
+
+// ── PCA9685 ───────────────────────────────────────────────────
+Adafruit_PWMServoDriver pca = Adafruit_PWMServoDriver(0x40);
+
+#define SERVO_MIN_US  500
+#define SERVO_MAX_US  2500
+#define OSC_FREQ      25000000
+#define PWM_FREQ_HZ   50
+
+// ── Servo Channel Assignments ─────────────────────────────────
+#define CH_BASE      0
+#define CH_SHOULDER  1
+#define CH_ELBOW     2
+#define CH_WRIST     3
+#define CH_GRIPPER   4
+#define NUM_SERVOS   5
+
+// ── Wheel + Obstacle Avoidance Pins (from obstacle_avoidance.ino) ──
+// Motor A (LEFT wheel relays)
+#define RA1  18
+#define RA2  19
+
+// Motor B (RIGHT wheel relays)
+#define RB1   4
+#define RB2  15
+
+// Main motor power relay (BC547 controlled)
+#define MAIN_RELAY 23
+
+// Ultrasonic sensors
+#define LEFT_TRIG   32
+#define LEFT_ECHO   33
+#define RIGHT_TRIG  25
+#define RIGHT_ECHO  26
+
+// Relay logic used in obstacle_avoidance.ino
+#define ON   LOW
+#define OFF  HIGH
+
+// Main motor power relay polarity (active-LOW on current hardware)
+// If your relay module is active-HIGH, swap these two values.
+#define MAIN_RELAY_ACTIVE_LEVEL    LOW
+#define MAIN_RELAY_INACTIVE_LEVEL  HIGH
+
+// ── Servo Config ──────────────────────────────────────────────
+struct ServoConfig {
+  const char* name;
+  const char* icon;
+  const char* sub;
+  int  channel;
+  int  minAngle;
+  int  maxAngle;
+  int  homeAngle;
+};
+
+ServoConfig servos[NUM_SERVOS] = {
+  //   name         icon   subtitle               ch           min  max  home
+  { "Base",     "🔄", "Rotation / Yaw",      CH_BASE,       0, 180,  95 },
+  { "Shoulder", "💪", "Joint 1 / Lift",      CH_SHOULDER,   0, 180, 180 },
+  { "Elbow",    "🦾", "Joint 2 / Reach",     CH_ELBOW,      0, 180,   0 },
+  { "Wrist",    "🤚", "Joint 3 / Tilt",      CH_WRIST,     30, 180,  55 },
+  { "Gripper",  "✊", "End Effector",        CH_GRIPPER,    0, 180, 110 },
+};
+
+// ── Startup Target Angles ─────────────────────────────────────
+//                   Base  Shoulder  Elbow  Wrist  Gripper
+int startupAngles[NUM_SERVOS] = { 95, 180, 0, 55, 110 };
+
+// ── Speed Settings ────────────────────────────────────────────
+#define SERVO_SPEED          60   // °/s average runtime speed
+#define SERVO_EASE_MIN_MS   120   // minimum move time so easing is visible
+
+// ── Gripper open/close angles ─────────────────────────────────
+#define GRIPPER_OPEN    170  // open/ready (used before pickup and at drop)
+#define GRIPPER_CLOSE   90   // gripping
+
+// ── Sequence timing (for more natural movement) ───────────────
+#define SEQ_GRIP_SETTLE_MS       900
+#define SEQ_RELEASE_SETTLE_MS    700
+#define SEQ_REARM_DELAY_MS      1200   // ignore new app detections briefly after completion
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║                  PRESET LOCATIONS                           ║
+// ║                                                             ║
+// ║  4 presets: pickup1, pickup2, drop1, drop2                  ║
+// ║  Angles: { Base, Shoulder, Elbow, Wrist, Gripper }          ║
+// ║                                                             ║
+// ║  These are placeholder values — calibrate using the web     ║
+// ║  dashboard's "Save as Preset" buttons, then hard-code here. ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+struct Preset {
+  const char* name;
+  const char* label;
+  int angles[NUM_SERVOS];   // Base, Shoulder, Elbow, Wrist, Gripper
+};
+
+// NOTE: Gripper angle in presets = arm position (gripper open while moving,
+//       gripper closes/opens during pick/drop — handled by the sequence).
+//       The Gripper value here is the "approach" gripper state (open = GRIPPER_OPEN).
+Preset presets[4] = {
+  { "pickup1", "Paper — Pickup",   { 100,  93,   7, 127, GRIPPER_OPEN } },
+  { "pickup2", "Plastic — Pickup", { 100,  93,   7, 127, GRIPPER_OPEN } },
+  { "drop1",   "Paper — Drop",     {  69, 110, 180, 175, GRIPPER_OPEN } },
+  { "drop2",   "Plastic — Drop",   { 125, 110, 180, 175, GRIPPER_OPEN } },
+};
+
+// Safe transit height (arm raised safely before moving between positions)
+int transitAngles[NUM_SERVOS] = { 95, 160, 20, 60, GRIPPER_OPEN };
+
+// ── Runtime State ─────────────────────────────────────────────
+int currentAngles[NUM_SERVOS] = { 0, 0, 0, 0, 0 };
+int targetAngles[NUM_SERVOS]  = { 0, 0, 0, 0, 0 };
+int motionStartAngles[NUM_SERVOS] = { 0, 0, 0, 0, 0 };
+unsigned long motionStartMs[NUM_SERVOS] = { 0, 0, 0, 0, 0 };
+unsigned long motionDurationMs[NUM_SERVOS] = { 0, 0, 0, 0, 0 };
+unsigned long lastStepMs = 0;
+
+// Sequence state machine
+bool        seqRunning  = false;
+int         seqStep     = 0;
+int         seqObj      = 0;   // 0 = Paper, 1 = Plastic
+bool        seqWaiting  = false;
+unsigned long seqWaitUntil = 0;
+
+// App-triggered detection gating
+unsigned long rearmAfterMs = 0;      // ignore /update triggers until this timestamp
+int lastDetectedType = -1;           // -1 none, 0 paper, 1 plastic
+String lastDetectedName = "None";
+unsigned long lastDetectedAtMs = 0;
+String lastUpdateSource = "none";    // "manual" or "app"
+
+// Integrated mobility/input modes
+bool wheelsEnabled = false;          // default OFF at boot
+bool appInputEnabled = true;         // default ON at boot
+bool autoResumeWheelsAfterSeq = false;
+
+// Last obstacle sensor snapshots (for status telemetry)
+long lastLeftDistanceCm = 999;
+long lastRightDistanceCm = 999;
+
+// Obstacle behavior settings (from obstacle_avoidance.ino)
+int obstacleDistance = 25;
+int directionChangeDelay = 300;
+int smoothDelay = 400;
+int turnLoopDelay = 250;
+
+// Sequence steps enum
+enum SeqStep {
+  SEQ_TRANSIT_UP = 0,
+  SEQ_GOTO_PICKUP,
+  SEQ_CLOSE_GRIPPER,
+  SEQ_WAIT_GRIP,
+  SEQ_TRANSIT_WITH_OBJECT,
+  SEQ_GOTO_DROP,
+  SEQ_OPEN_GRIPPER,
+  SEQ_WAIT_RELEASE,
+  SEQ_TRANSIT_FINAL,
+  SEQ_DONE
+};
+
+// ── Web Server ────────────────────────────────────────────────
+AsyncWebServer server(80);
+
+// ── Helper: angle → PCA9685 tick ─────────────────────────────
+uint16_t angleToPwm(int angle, int minAngle, int maxAngle) {
+  angle = constrain(angle, minAngle, maxAngle);
+  float fraction   = (float)(angle - minAngle) / (maxAngle - minAngle);
+  float us         = SERVO_MIN_US + fraction * (SERVO_MAX_US - SERVO_MIN_US);
+  float ticksPerUs = (4096.0f * PWM_FREQ_HZ) / 1000000.0f;
+  return (uint16_t)(us * ticksPerUs);
+}
+
+int clampAngle(int ch, int angle) {
+  return constrain(angle, servos[ch].minAngle, servos[ch].maxAngle);
+}
+
+void writeServoNow(int ch, int angle) {
+  angle = clampAngle(ch, angle);
+  uint16_t tick = angleToPwm(angle, servos[ch].minAngle, servos[ch].maxAngle);
+  pca.setPWM(servos[ch].channel, 0, tick);
+  currentAngles[ch] = angle;
+}
+
+void setPcaOutputsEnabled(bool enable) {
+  if (PCA_OE_PIN < 0) return;
+  // OE active-high: HIGH disables outputs, LOW enables outputs.
+  digitalWrite(PCA_OE_PIN, enable ? LOW : HIGH);
+}
+
+void setServoAngle(int ch, int angle) {
+  int clamped = clampAngle(ch, angle);
+
+  // If nothing changes, avoid restarting easing profile.
+  if (clamped == targetAngles[ch]) return;
+
+  int start = currentAngles[ch];
+  targetAngles[ch] = clamped;
+  motionStartAngles[ch] = start;
+  motionStartMs[ch] = millis();
+
+  int travel = abs(clamped - start);
+  if (travel <= 1) {
+    motionDurationMs[ch] = 0;
+    return;
+  }
+
+  unsigned long duration = (unsigned long)((1000.0f * travel) / SERVO_SPEED);
+  if (duration < SERVO_EASE_MIN_MS) duration = SERVO_EASE_MIN_MS;
+  motionDurationMs[ch] = duration;
+}
+
+void setAllAngles(int angles[NUM_SERVOS]) {
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    setServoAngle(i, angles[i]);
+  }
+}
+
+bool allAtTarget() {
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    if (abs(currentAngles[i] - targetAngles[i]) > 2) return false;
+  }
+  return true;
+}
+
+// ── Non-blocking eased motion (S-curve: slow→fast→slow) ─────
+void updateServos() {
+  unsigned long now = millis();
+  unsigned long dt  = now - lastStepMs;
+  if (dt < 20) return;
+  lastStepMs = now;
+
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    int cur = currentAngles[i];
+    int tgt = targetAngles[i];
+    if (cur == tgt) continue;
+
+    unsigned long dur = motionDurationMs[i];
+    if (dur == 0) {
+      writeServoNow(i, tgt);
+      continue;
+    }
+
+    unsigned long elapsed = now - motionStartMs[i];
+    if (elapsed >= dur) {
+      writeServoNow(i, tgt);
+      motionDurationMs[i] = 0;
+      continue;
+    }
+
+    float t = (float)elapsed / (float)dur;               // 0..1
+    float eased = t * t * (3.0f - 2.0f * t);            // smoothstep S-curve
+
+    int start = motionStartAngles[i];
+    float interp = start + (tgt - start) * eased;
+    int next = (int)(interp + (interp >= 0 ? 0.5f : -0.5f));
+    next = clampAngle(i, next);
+
+    // Ensure progress if integer rounding stalls mid-motion.
+    if (next == cur) next += (tgt > cur) ? 1 : -1;
+    next = clampAngle(i, next);
+
+    writeServoNow(i, next);
+  }
+}
+
+// ── Blocking sweep (setup only) ───────────────────────────────
+void sweepBlocking(int destAngles[], int speedDegPerSec) {
+  for (int i = 0; i < NUM_SERVOS; i++) targetAngles[i] = clampAngle(i, destAngles[i]);
+  unsigned long stepTime = millis();
+  bool allDone = false;
+  while (!allDone) {
+    unsigned long now = millis();
+    unsigned long dt  = now - stepTime;
+    if (dt >= 20) {
+      stepTime = now;
+      allDone  = true;
+      float maxStep = (speedDegPerSec * dt) / 1000.0f;
+      if (maxStep < 1.0f) maxStep = 1.0f;
+      for (int i = 0; i < NUM_SERVOS; i++) {
+        int cur = currentAngles[i];
+        int tgt = targetAngles[i];
+        if (cur == tgt) continue;
+        allDone = false;
+        int diff = tgt - cur;
+        int step = (abs(diff) <= (int)maxStep) ? diff
+                                               : (diff > 0 ? (int)maxStep : -(int)maxStep);
+        if (step == 0) step = (diff > 0) ? 1 : -1;
+        writeServoNow(i, cur + step);
+      }
+    }
+    delay(1);
+  }
+}
+
+void moveAllHome() {
+  for (int i = 0; i < NUM_SERVOS; i++) setServoAngle(i, servos[i].homeAngle);
+}
+
+// ── Wheel/Motor Control (relay-safe; from obstacle_avoidance.ino) ─────────
+void motorPowerON() {
+  digitalWrite(MAIN_RELAY, MAIN_RELAY_ACTIVE_LEVEL);
+}
+
+void motorPowerOFF() {
+  digitalWrite(MAIN_RELAY, MAIN_RELAY_INACTIVE_LEVEL);
+}
+
+void leftForward() {
+  digitalWrite(RA1, ON);
+  digitalWrite(RA2, ON);
+}
+
+void leftReverse() {
+  digitalWrite(RA1, OFF);
+  digitalWrite(RA2, OFF);
+}
+
+void rightForward() {
+  digitalWrite(RB1, ON);
+  digitalWrite(RB2, ON);
+}
+
+void rightReverse() {
+  digitalWrite(RB1, OFF);
+  digitalWrite(RB2, OFF);
+}
+
+void moveForward() {
+  leftForward();
+  rightForward();
+}
+
+void turnRight() {
+  leftForward();
+  rightReverse();
+}
+
+void turnLeft() {
+  leftReverse();
+  rightForward();
+}
+
+void stopMotors() {
+  // True coast stop via main power relay (requested behavior).
+  motorPowerOFF();
+}
+
+void safeForward() {
+  motorPowerOFF();
+  delay(directionChangeDelay);
+  moveForward();
+  delay(50);
+  motorPowerON();
+}
+
+void safeTurnRight() {
+  motorPowerOFF();
+  delay(directionChangeDelay);
+  turnRight();
+  delay(50);
+  motorPowerON();
+}
+
+void safeTurnLeft() {
+  motorPowerOFF();
+  delay(directionChangeDelay);
+  turnLeft();
+  delay(50);
+  motorPowerON();
+}
+
+long readDistance(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 30000);
+  long distance = duration * 0.034 / 2;
+  if (distance == 0) distance = 999;
+  return distance;
+}
+
+void setWheelsEnabled(bool enabled) {
+  wheelsEnabled = enabled;
+  if (!wheelsEnabled) {
+    stopMotors();
+    autoResumeWheelsAfterSeq = false;
+    Serial.printf("[WHEELS] Disabled -> MAIN_RELAY set to OFF level (%d)\n", MAIN_RELAY_INACTIVE_LEVEL);
+  } else {
+    Serial.printf("[WHEELS] Enabled -> obstacle avoidance active (MAIN_RELAY ON level %d when moving)\n", MAIN_RELAY_ACTIVE_LEVEL);
+  }
+}
+
+void setAppInputEnabled(bool enabled) {
+  if (appInputEnabled == enabled) return;
+  appInputEnabled = enabled;
+  Serial.printf("[APP INPUT] %s\n", appInputEnabled ? "Enabled" : "Disabled");
+}
+
+void runObstacleAvoidance() {
+  if (!wheelsEnabled) return;
+  if (seqRunning) return;
+
+  long leftDistance  = readDistance(LEFT_TRIG, LEFT_ECHO);
+  long rightDistance = readDistance(RIGHT_TRIG, RIGHT_ECHO);
+  lastLeftDistanceCm = leftDistance;
+  lastRightDistanceCm = rightDistance;
+
+  if (leftDistance < obstacleDistance) {
+    Serial.println("[WHEELS] Obstacle LEFT");
+    stopMotors();
+    delay(smoothDelay);
+    safeTurnRight();
+    while (wheelsEnabled && !seqRunning && readDistance(LEFT_TRIG, LEFT_ECHO) < obstacleDistance) {
+      Serial.println("[WHEELS] Turning RIGHT");
+      delay(turnLoopDelay);
+    }
+    stopMotors();
+    delay(smoothDelay);
+    return;
+  }
+
+  if (rightDistance < obstacleDistance) {
+    Serial.println("[WHEELS] Obstacle RIGHT");
+    stopMotors();
+    delay(smoothDelay);
+    safeTurnLeft();
+    while (wheelsEnabled && !seqRunning && readDistance(RIGHT_TRIG, RIGHT_ECHO) < obstacleDistance) {
+      Serial.println("[WHEELS] Turning LEFT");
+      delay(turnLoopDelay);
+    }
+    stopMotors();
+    delay(smoothDelay);
+    return;
+  }
+
+  moveForward();
+  motorPowerON();
+  delay(100);
+}
+
+const char* objectName(int obj) {
+  return (obj == 0) ? "Paper" : "Plastic";
+}
+
+void startSequence(int obj, const char* source) {
+  seqObj = obj;
+  seqStep = 0;
+  seqRunning = true;
+  seqWaiting = false;
+  seqWaitUntil = 0;
+
+  lastDetectedType = obj;
+  lastDetectedName = objectName(obj);
+  lastDetectedAtMs = millis();
+  lastUpdateSource = source;
+
+  Serial.printf("[SEQ] Starting pick-and-drop for: %s (source=%s)\n", objectName(obj), source);
+}
+
+bool startManagedSequence(int obj, const char* source) {
+  if (seqRunning) return false;
+
+  // If wheels are enabled, always stop wheels before arm sequence.
+  if (wheelsEnabled) {
+    stopMotors();
+    autoResumeWheelsAfterSeq = true;
+  } else {
+    autoResumeWheelsAfterSeq = false;
+  }
+
+  startSequence(obj, source);
+  return true;
+}
+
+// Returns: 0=paper, 1=plastic, -1=unknown/invalid
+int resolveObjFromUpdatePayload(const String& body) {
+  // Text fallback first (handles raw payloads like "0", "1", "paper", "plastic")
+  String raw = body;
+  raw.trim();
+  String rawLower = raw;
+  rawLower.toLowerCase();
+  if (rawLower == "0" || rawLower == "paper")   return 0;
+  if (rawLower == "1" || rawLower == "plastic") return 1;
+  if (rawLower == "metal") return 0; // compatibility alias
+
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("[/update] JSON parse error: %s\n", err.c_str());
+    // Last-chance fuzzy parse from raw text
+    if (rawLower.indexOf("paper") >= 0 || rawLower.indexOf("metal") >= 0) return 0;
+    if (rawLower.indexOf("plastic") >= 0) return 1;
+    return -1;
+  }
+
+  // Primary format (as in sample): {"bin_type":0|1}
+  if (doc.containsKey("bin_type")) {
+    int t = doc["bin_type"].as<int>();
+    if (t == 0 || t == 1) return t;
+    return -1;
+  }
+
+  // Flexible fallback fields while app side is still evolving
+  const char* keys[] = { "status", "type", "label", "material", "waste_type", "bin_name", "class" };
+  for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+    if (doc.containsKey(keys[i])) {
+      String s = doc[keys[i]].as<String>();
+      s.toLowerCase();
+      if (s.indexOf("paper") >= 0)   return 0;
+      if (s.indexOf("plastic") >= 0) return 1;
+      if (s.indexOf("metal") >= 0)   return 0; // compatibility alias
+    }
+  }
+
+  return -1;
+}
+
+// ── Pick-and-Drop Sequence State Machine ──────────────────────
+// Called from loop() — non-blocking step execution.
+void runSequence() {
+  if (!seqRunning) return;
+
+  // If we're in a timed wait, check it
+  if (seqWaiting) {
+    if (millis() < seqWaitUntil) return;
+    seqWaiting = false;
+    seqStep++;
+  }
+
+  // If arm is still moving, wait for it
+  if (!allAtTarget()) return;
+
+  int pickupIdx = seqObj;       // 0 = pickup1, 1 = pickup2
+  int dropIdx   = seqObj + 2;   // 2 = drop1,   3 = drop2
+
+  switch (seqStep) {
+
+    case SEQ_TRANSIT_UP:
+      Serial.printf("[SEQ] Step 1 — Raise to transit height\n");
+      setAllAngles(transitAngles);
+      seqStep++;
+      break;
+
+    case SEQ_GOTO_PICKUP:
+      Serial.printf("[SEQ] Step 2 — Move to pickup%d\n", pickupIdx + 1);
+      setAllAngles(presets[pickupIdx].angles);
+      setServoAngle(CH_GRIPPER, GRIPPER_OPEN);
+      seqStep++;
+      break;
+
+    case SEQ_CLOSE_GRIPPER:
+      Serial.printf("[SEQ] Step 3 — Close gripper\n");
+      setServoAngle(CH_GRIPPER, GRIPPER_CLOSE);
+      seqWaiting   = true;
+      seqWaitUntil = millis() + SEQ_GRIP_SETTLE_MS;
+      break;
+
+    case SEQ_WAIT_GRIP:
+      // handled above in seqWaiting check → auto-advances
+      seqStep++;
+      break;
+
+    case SEQ_TRANSIT_WITH_OBJECT:
+      Serial.printf("[SEQ] Step 4 — Transit with object (gripper stays closed)\n");
+      setAllAngles(transitAngles);
+      setServoAngle(CH_GRIPPER, GRIPPER_CLOSE);  // keep closed during transit
+      seqStep++;
+      break;
+
+    case SEQ_GOTO_DROP:
+      Serial.printf("[SEQ] Step 5 — Move to drop%d\n", dropIdx - 1);
+      setAllAngles(presets[dropIdx].angles);
+      setServoAngle(CH_GRIPPER, GRIPPER_CLOSE);  // keep closed
+      seqStep++;
+      break;
+
+    case SEQ_OPEN_GRIPPER:
+      Serial.printf("[SEQ] Step 6 — Open gripper (drop object)\n");
+      setServoAngle(CH_GRIPPER, GRIPPER_OPEN);
+      seqWaiting   = true;
+      seqWaitUntil = millis() + SEQ_RELEASE_SETTLE_MS;
+      break;
+
+    case SEQ_WAIT_RELEASE:
+      seqStep++;
+      break;
+
+    case SEQ_TRANSIT_FINAL:
+      Serial.printf("[SEQ] Step 7 — Return all joints to home (idle pose)\n");
+      moveAllHome();
+      seqStep++;
+      break;
+
+    case SEQ_DONE:
+      Serial.printf("[SEQ] Done — %s delivered.\n", objectName(seqObj));
+      seqRunning = false;
+      seqStep    = 0;
+      // Start short re-arm delay to ignore duplicate app spam right after drop
+      rearmAfterMs = millis() + SEQ_REARM_DELAY_MS;
+
+      // Resume obstacle-avoidance driving only if wheels are still enabled.
+      if (wheelsEnabled && autoResumeWheelsAfterSeq) {
+        Serial.println("[WHEELS] Sequence complete -> resuming drive");
+        safeForward();
+      }
+      autoResumeWheelsAfterSeq = false;
+      break;
+  }
+}
+
+// ── JSON builders ─────────────────────────────────────────────
+String buildConfigJson() {
+  String json = "{\"servos\":[";
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    json += "{";
+    json += "\"id\":"      + String(i)                   + ",";
+    json += "\"name\":\""  + String(servos[i].name)      + "\",";
+    json += "\"icon\":\""  + String(servos[i].icon)      + "\",";
+    json += "\"sub\":\""   + String(servos[i].sub)       + "\",";
+    json += "\"min\":"     + String(servos[i].minAngle)  + ",";
+    json += "\"max\":"     + String(servos[i].maxAngle)  + ",";
+    json += "\"home\":"    + String(servos[i].homeAngle) + ",";
+    json += "\"current\":" + String(currentAngles[i]);
+    json += "}";
+    if (i < NUM_SERVOS - 1) json += ",";
+  }
+  json += "],\"presets\":[";
+  for (int p = 0; p < 4; p++) {
+    json += "{\"id\":" + String(p) + ",\"name\":\"" + presets[p].name + "\",\"label\":\"" + presets[p].label + "\",\"angles\":[";
+    for (int i = 0; i < NUM_SERVOS; i++) {
+      json += String(presets[p].angles[i]);
+      if (i < NUM_SERVOS - 1) json += ",";
+    }
+    json += "]}";
+    if (p < 3) json += ",";
+  }
+  json += "],\"seqRunning\":" + String(seqRunning ? "true" : "false");
+  json += ",\"wheelsEnabled\":" + String(wheelsEnabled ? "true" : "false");
+  json += ",\"appInputEnabled\":" + String(appInputEnabled ? "true" : "false") + "}";
+  return json;
+}
+
+// Lightweight status — polled every 500ms by the dashboard.
+// Returns live angles + busy flag + status text.
+String buildStatusJson() {
+  const char* stepLabels[] = {
+    "Raising to transit height",
+    "Moving to pickup",
+    "Closing gripper",
+    "Gripping...",
+    "Transiting with object",
+    "Moving to drop",
+    "Opening gripper",
+    "Releasing...",
+    "Returning to home",
+    "Done"
+  };
+
+  String label = seqRunning ? String(stepLabels[seqStep]) : "Idle";
+  String json = "{";
+  json += "\"busy\":" + String(seqRunning ? "true" : "false") + ",";
+  json += "\"status\":\"" + String(seqRunning ? "RUNNING" : "IDLE") + "\",";
+  json += "\"task\":\"" + label + "\",";
+  json += "\"wheels_enabled\":" + String(wheelsEnabled ? "true" : "false") + ",";
+  json += "\"app_input_enabled\":" + String(appInputEnabled ? "true" : "false") + ",";
+  json += "\"left_distance_cm\":" + String(lastLeftDistanceCm) + ",";
+  json += "\"right_distance_cm\":" + String(lastRightDistanceCm) + ",";
+  json += "\"last_detected_type\":" + String(lastDetectedType) + ",";
+  json += "\"last_detected_name\":\"" + lastDetectedName + "\",";
+  json += "\"last_source\":\"" + lastUpdateSource + "\",";
+  json += "\"ap_clients\":" + String(WiFi.softAPgetStationNum()) + ",";
+  json += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"sta_connected\":" + String((WiFi.status() == WL_CONNECTED) ? "true" : "false") + ",";
+  json += "\"sta_ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"uptime_s\":" + String(millis() / 1000) + ",";
+
+  long rearmInMs = (long)rearmAfterMs - (long)millis();
+  if (rearmInMs < 0) rearmInMs = 0;
+  json += "\"rearm_in_ms\":" + String(rearmInMs) + ",";
+
+  json += "\"angles\":[";
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    json += String(currentAngles[i]);
+    if (i < NUM_SERVOS - 1) json += ",";
+  }
+  json += "]}";
+  return json;
+}
+
+// ── HTML Dashboard ────────────────────────────────────────────
+const char HTML_PAGE[] PROGMEM = R"=====(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Robotic Arm + Wheels Control</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;600;800&display=swap');
+
+  :root {
+    --bg:      #0a0c10;
+    --surface: #111520;
+    --border:  #1e2a40;
+    --accent:  #00d4ff;
+    --accent2: #ff6b35;
+    --green:   #22c55e;
+    --yellow:  #f59e0b;
+    --text:    #c8d8f0;
+    --dim:     #4a5a78;
+    --glow:    0 0 18px rgba(0,212,255,0.35);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    font-family: 'Exo 2', sans-serif;
+    color: var(--text);
+    min-height: 100vh;
+    padding: 20px;
+    background-image:
+      radial-gradient(ellipse at 20% 10%, rgba(0,212,255,0.05) 0%, transparent 50%),
+      radial-gradient(ellipse at 80% 90%, rgba(255,107,53,0.05) 0%, transparent 50%);
+  }
+
+  header {
+    text-align: center; margin-bottom: 32px;
+    padding-bottom: 20px; border-bottom: 1px solid var(--border);
+  }
+
+  .logo-line {
+    display: flex; align-items: center;
+    justify-content: center; gap: 14px; margin-bottom: 6px;
+  }
+  .arm-icon { font-size: 2rem; filter: drop-shadow(0 0 8px var(--accent)); }
+  h1 {
+    font-size: 2rem; font-weight: 800;
+    letter-spacing: 3px; text-transform: uppercase;
+    background: linear-gradient(90deg, var(--accent), #60efff);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .subtitle {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.72rem; color: var(--dim);
+    letter-spacing: 4px; text-transform: uppercase;
+  }
+  .status-bar {
+    display: flex; align-items: center; justify-content: center;
+    gap: 8px; margin-top: 12px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.75rem; color: var(--dim);
+  }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green); box-shadow: 0 0 8px var(--green);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+  /* Section headers */
+  .section-title {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.7rem; letter-spacing: 4px;
+    text-transform: uppercase; color: var(--dim);
+    margin: 28px auto 14px;
+    max-width: 1100px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* Servo cards */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+    gap: 16px; max-width: 1100px; margin: 0 auto 24px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px; padding: 22px;
+    position: relative; overflow: hidden;
+    transition: border-color 0.3s, box-shadow 0.3s;
+  }
+  .card::before {
+    content: ''; position: absolute;
+    top: 0; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    opacity: 0; transition: opacity 0.3s;
+  }
+  .card:hover { border-color: var(--accent); box-shadow: var(--glow); }
+  .card:hover::before { opacity: 1; }
+  .gripper-card:hover { border-color: var(--accent2); box-shadow: 0 0 18px rgba(255,107,53,0.35); }
+
+  .card-header {
+    display: flex; align-items: center;
+    justify-content: space-between; margin-bottom: 12px;
+  }
+  .joint-label { display: flex; align-items: center; gap: 10px; }
+  .joint-icon {
+    width: 36px; height: 36px; border-radius: 8px;
+    background: rgba(0,212,255,0.1);
+    border: 1px solid rgba(0,212,255,0.25);
+    display: flex; align-items: center;
+    justify-content: center; font-size: 1.1rem;
+  }
+  .gripper-card .joint-icon { background: rgba(255,107,53,0.1); border-color: rgba(255,107,53,0.25); }
+  .joint-name { font-weight: 600; font-size: 1rem; letter-spacing: 1px; text-transform: uppercase; color: #e0eeff; }
+  .joint-sub { font-family: 'Share Tech Mono', monospace; font-size: 0.65rem; color: var(--dim); letter-spacing: 1px; }
+  .angle-display {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 1.6rem; font-weight: bold;
+    color: var(--accent);
+    text-shadow: 0 0 12px rgba(0,212,255,0.5);
+    min-width: 60px; text-align: right;
+  }
+  .gripper-card .angle-display { color: var(--accent2); text-shadow: 0 0 12px rgba(255,107,53,0.5); }
+
+  .limit-row { display: flex; gap: 6px; margin-bottom: 12px; }
+  .limit-badge {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.6rem; padding: 2px 8px;
+    border-radius: 4px; letter-spacing: 1px;
+  }
+  .badge-min { border: 1px solid rgba(255,107,53,0.5); color: rgba(255,107,53,0.8); background: rgba(255,107,53,0.06); }
+  .badge-max { border: 1px solid rgba(0,212,255,0.5);  color: rgba(0,212,255,0.8);  background: rgba(0,212,255,0.06); }
+  .badge-home { border: 1px solid rgba(34,197,94,0.4); color: rgba(34,197,94,0.7);  background: rgba(34,197,94,0.05); }
+
+  input[type=range] {
+    -webkit-appearance: none; width: 100%; height: 6px;
+    border-radius: 3px; background: var(--border);
+    outline: none; cursor: pointer; margin-bottom: 5px;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 20px; height: 20px; border-radius: 50%;
+    background: var(--accent); box-shadow: 0 0 10px rgba(0,212,255,0.6);
+    cursor: pointer; transition: transform 0.15s, box-shadow 0.15s;
+  }
+  input[type=range]::-webkit-slider-thumb:hover { transform: scale(1.25); box-shadow: 0 0 18px rgba(0,212,255,0.9); }
+  .gripper-card input[type=range]::-webkit-slider-thumb { background: var(--accent2); box-shadow: 0 0 10px rgba(255,107,53,0.6); }
+  .gripper-card input[type=range]::-webkit-slider-thumb:hover { box-shadow: 0 0 18px rgba(255,107,53,0.9); }
+
+  .range-labels {
+    display: flex; justify-content: space-between;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.62rem; color: var(--dim); margin-bottom: 12px;
+  }
+  .btn-row { display: flex; gap: 7px; }
+  .btn {
+    flex: 1; padding: 7px 0;
+    border-radius: 7px; border: 1px solid var(--border);
+    background: transparent; color: var(--dim);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.68rem; letter-spacing: 1px;
+    cursor: pointer; transition: all 0.2s;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(0,212,255,0.07); }
+
+  /* Global action buttons */
+  .actions {
+    display: flex; gap: 12px; justify-content: center;
+    max-width: 1100px; margin: 0 auto; flex-wrap: wrap;
+  }
+  .action-btn {
+    padding: 12px 28px; border-radius: 10px; border: 1px solid;
+    font-family: 'Exo 2', sans-serif; font-weight: 600;
+    font-size: 0.9rem; letter-spacing: 2px; text-transform: uppercase;
+    cursor: pointer; transition: all 0.25s;
+  }
+  .btn-home  { border-color: var(--accent);  color: var(--accent);  background: rgba(0,212,255,0.08); }
+  .btn-home:hover { background: rgba(0,212,255,0.2); box-shadow: var(--glow); }
+  .btn-open  { border-color: var(--green); color: var(--green); background: rgba(34,197,94,0.08); }
+  .btn-open:hover  { background: rgba(34,197,94,0.2); }
+  .btn-close { border-color: var(--accent2); color: var(--accent2); background: rgba(255,107,53,0.08); }
+  .btn-close:hover { background: rgba(255,107,53,0.2); }
+
+  /* ── Preset Section ────────────────────────────────────────── */
+  .preset-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 14px; max-width: 1100px; margin: 0 auto 24px;
+  }
+
+  .preset-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px;
+    transition: border-color 0.3s, box-shadow 0.3s;
+  }
+
+  .preset-card.pickup { border-left: 3px solid var(--green); }
+  .preset-card.drop   { border-left: 3px solid var(--accent2); }
+
+  .preset-title {
+    font-weight: 700; font-size: 0.95rem;
+    text-transform: uppercase; letter-spacing: 2px;
+    margin-bottom: 4px;
+  }
+  .preset-card.pickup .preset-title { color: var(--green); }
+  .preset-card.drop   .preset-title { color: var(--accent2); }
+
+  .preset-angles {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.65rem; color: var(--dim);
+    letter-spacing: 1px; margin-bottom: 14px;
+    line-height: 1.8;
+  }
+
+  .preset-btn-row { display: flex; gap: 8px; }
+
+  .preset-btn {
+    flex: 1; padding: 9px 0;
+    border-radius: 8px; border: 1px solid var(--border);
+    background: transparent; color: var(--dim);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.7rem; letter-spacing: 1px;
+    cursor: pointer; transition: all 0.2s;
+  }
+  .preset-btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(0,212,255,0.07); }
+
+  .preset-btn.save-btn:hover { border-color: var(--yellow); color: var(--yellow); background: rgba(245,158,11,0.08); }
+
+  /* Saved indicator */
+  .saved-flash {
+    animation: saved 0.8s ease-out;
+  }
+  @keyframes saved {
+    0%   { border-color: var(--yellow); box-shadow: 0 0 14px rgba(245,158,11,0.6); }
+    100% { border-color: var(--border); box-shadow: none; }
+  }
+
+  /* ── Pick & Drop Section ───────────────────────────────────── */
+  .pickdrop-panel {
+    max-width: 1100px; margin: 0 auto 24px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px; padding: 24px;
+  }
+
+  .pd-title {
+    font-weight: 700; font-size: 1rem;
+    text-transform: uppercase; letter-spacing: 3px;
+    color: var(--accent); margin-bottom: 6px;
+  }
+
+  .pd-sub {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.68rem; color: var(--dim);
+    letter-spacing: 1px; margin-bottom: 18px;
+  }
+
+  .pd-buttons { display: flex; gap: 14px; flex-wrap: wrap; }
+
+  .pd-btn {
+    flex: 1; min-width: 180px; padding: 16px 20px;
+    border-radius: 12px; border: 1px solid;
+    font-family: 'Exo 2', sans-serif; font-weight: 700;
+    font-size: 1rem; letter-spacing: 2px; text-transform: uppercase;
+    cursor: pointer; transition: all 0.25s;
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+  }
+  .pd-btn .pd-icon { font-size: 1.5rem; }
+  .pd-btn .pd-label { font-size: 0.75rem; letter-spacing: 3px; color: var(--dim); font-weight: 400; }
+
+  .pd-obj1 { border-color: var(--green);   color: var(--green);   background: rgba(34,197,94,0.08); }
+  .pd-obj1:hover { background: rgba(34,197,94,0.2); box-shadow: 0 0 18px rgba(34,197,94,0.3); }
+  .pd-obj2 { border-color: var(--yellow);  color: var(--yellow);  background: rgba(245,158,11,0.08); }
+  .pd-obj2:hover { background: rgba(245,158,11,0.2); box-shadow: 0 0 18px rgba(245,158,11,0.3); }
+  .pd-stop { border-color: #ef4444; color: #ef4444; background: rgba(239,68,68,0.08); }
+  .pd-stop:hover { background: rgba(239,68,68,0.2); }
+
+  .pd-btn:disabled, .pd-btn[disabled] {
+    opacity: 0.35; cursor: not-allowed; pointer-events: none;
+  }
+
+  .seq-status {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.72rem; color: var(--dim);
+    margin-top: 14px; letter-spacing: 1px;
+  }
+  .seq-status.running { color: var(--green); }
+
+  /* ── Mode Toggles ─────────────────────────────────────────── */
+  .mode-panel {
+    max-width: 1100px; margin: 0 auto 24px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 14px; padding: 18px;
+  }
+  .mode-title {
+    font-weight: 700; font-size: 0.95rem; letter-spacing: 2px;
+    text-transform: uppercase; color: var(--accent); margin-bottom: 6px;
+  }
+  .mode-sub {
+    font-family: "Share Tech Mono", monospace;
+    font-size: 0.68rem; color: var(--dim); margin-bottom: 12px;
+  }
+  .mode-buttons { display: flex; gap: 12px; flex-wrap: wrap; }
+  .mode-btn {
+    flex: 1; min-width: 250px; padding: 12px 16px;
+    border-radius: 10px; border: 1px solid var(--border);
+    background: transparent; color: var(--dim);
+    font-family: "Share Tech Mono", monospace;
+    font-size: 0.78rem; letter-spacing: 1px;
+    cursor: pointer; transition: all 0.2s;
+  }
+  .mode-btn.mode-on {
+    border-color: var(--green); color: var(--green);
+    background: rgba(34,197,94,0.1);
+  }
+  .mode-btn.mode-off {
+    border-color: #ef4444; color: #ef4444;
+    background: rgba(239,68,68,0.1);
+  }
+  .mode-note {
+    margin-top: 10px; font-family: "Share Tech Mono", monospace;
+    font-size: 0.65rem; color: var(--dim);
+  }
+
+  /* Toast */
+  .toast {
+    position: fixed; bottom: 24px; right: 24px;
+    background: var(--surface); border: 1px solid var(--accent);
+    color: var(--accent); font-family: 'Share Tech Mono', monospace;
+    font-size: 0.78rem; padding: 10px 18px; border-radius: 8px;
+    box-shadow: var(--glow); opacity: 0; transform: translateY(12px);
+    transition: all 0.3s; pointer-events: none; z-index: 100;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); }
+
+  #loading { text-align: center; padding: 60px; font-family: 'Share Tech Mono', monospace; color: var(--dim); letter-spacing: 3px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo-line">
+    <span class="arm-icon">🦾</span>
+    <h1>Arm + Wheels Control</h1>
+  </div>
+  <div class="subtitle">ESP32 · PCA9685 · 5-DOF · Wheels OA · v4.0</div>
+  <div class="status-bar">
+    <div class="status-dot"></div>
+    <span>CONNECTED &mdash; LIVE CONTROL</span>
+  </div>
+</header>
+
+<div class="section-title">⚙️ Mobility &amp; App Input</div>
+<div class="mode-panel">
+  <div class="mode-title">System Toggles</div>
+  <div class="mode-sub">Wheels default OFF at boot. Mobile app detection input default ON at boot.</div>
+  <div class="mode-buttons">
+    <button class="mode-btn mode-off" id="btnWheelsToggle" onclick="toggleWheels()">🛞 Wheels: OFF</button>
+    <button class="mode-btn mode-on" id="btnAppInputToggle" onclick="toggleAppInput()">📲 App Detection Input: ON</button>
+  </div>
+  <div class="mode-note" id="modeNote">When Wheels are ON, obstacle avoidance drives until a Paper/Plastic sequence is triggered.</div>
+</div>
+
+<!-- ── Pick & Drop ──────────────────────────────────────────── -->
+<div class="section-title">⚡ Pick &amp; Drop Sequences</div>
+<div class="pickdrop-panel">
+  <div class="pd-title">Automated Sequences</div>
+  <div class="pd-sub">Arm moves to pickup → grabs → transits → drops into basket. Uses preset positions below.</div>
+  <div class="pd-buttons">
+    <button class="pd-btn pd-obj1" id="btnObj1" onclick="runPickDrop(0)">
+      <span class="pd-icon">📄</span>
+      <span>Pick &amp; Drop Paper</span>
+      <span class="pd-label">Paper Pickup → Paper Drop</span>
+    </button>
+    <button class="pd-btn pd-obj2" id="btnObj2" onclick="runPickDrop(1)">
+      <span class="pd-icon">🧴</span>
+      <span>Pick &amp; Drop Plastic</span>
+      <span class="pd-label">Plastic Pickup → Plastic Drop</span>
+    </button>
+    <button class="pd-btn pd-stop" id="btnStop" onclick="stopSeq()">
+      <span class="pd-icon">🛑</span>
+      <span>Stop</span>
+      <span class="pd-label">Emergency Stop</span>
+    </button>
+  </div>
+  <div class="seq-status" id="seqStatus">IDLE — Ready</div>
+</div>
+
+<!-- ── Presets ──────────────────────────────────────────────── -->
+<div class="section-title">📍 Preset Positions</div>
+<div class="preset-grid" id="presetGrid">
+  <div id="loading">LOADING PRESETS...</div>
+</div>
+
+<!-- ── Servo Controls ───────────────────────────────────────── -->
+<div class="section-title">🎛 Manual Control</div>
+<div class="grid" id="servoGrid"></div>
+
+<div class="actions">
+  <button class="action-btn btn-home"  onclick="homeAll()">⌂ Home All</button>
+  <button class="action-btn btn-open"  onclick="setGripper('min')">◇ Open Gripper</button>
+  <button class="action-btn btn-close" onclick="setGripper('max')">◆ Close Gripper</button>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let joints  = [];
+let presets = [];
+let seqPoll = null;
+let wheelsEnabled = false;
+let appInputEnabled = true;
+
+// Load config (joints + presets)
+fetch('/config')
+  .then(r => r.json())
+  .then(data => {
+    joints  = data.servos.map((s, idx) => ({
+      id: s.id, name: s.name, icon: s.icon, sub: s.sub,
+      min: s.min, max: s.max, home: s.home, val: s.current,
+      isGripper: idx === data.servos.length - 1
+    }));
+    presets = data.presets;
+    wheelsEnabled = !!data.wheelsEnabled;
+    appInputEnabled = (data.appInputEnabled !== undefined) ? !!data.appInputEnabled : true;
+    renderModeButtons();
+    buildServoUI();
+    buildPresetUI();
+    if (data.seqRunning) setSeqRunning(true);
+    // Always poll /status so sliders stay live even when idle
+    if (!seqPoll) seqPoll = setInterval(pollSeqStatus, 500);
+  })
+  .catch(() => {
+    document.getElementById('loading').textContent = '⚠ Failed to load config';
+  });
+
+function renderModeButtons() {
+  const wb = document.getElementById("btnWheelsToggle");
+  const ab = document.getElementById("btnAppInputToggle");
+  const note = document.getElementById("modeNote");
+  if (!wb || !ab || !note) return;
+
+  wb.textContent = wheelsEnabled ? "🛞 Wheels: ON" : "🛞 Wheels: OFF";
+  wb.classList.toggle("mode-on", wheelsEnabled);
+  wb.classList.toggle("mode-off", !wheelsEnabled);
+
+  ab.textContent = appInputEnabled ? "📲 App Detection Input: ON" : "📲 App Detection Input: OFF";
+  ab.classList.toggle("mode-on", appInputEnabled);
+  ab.classList.toggle("mode-off", !appInputEnabled);
+
+  note.textContent = wheelsEnabled
+    ? "Wheels ON: obstacle avoidance active. Sequences pause wheels, then resume after drop."
+    : "Wheels OFF: motor relay is OFF. Arm can still be controlled from dashboard.";
+}
+
+function toggleWheels() {
+  const next = wheelsEnabled ? 0 : 1;
+  fetch(`/set_wheels?enabled=${next}`)
+    .then(r => r.json())
+    .then(s => {
+      wheelsEnabled = !!s.wheels_enabled;
+      renderModeButtons();
+      const relayInfo = (s.main_relay_level !== undefined)
+        ? ` (relay pin ${s.main_relay_pin}: level ${s.main_relay_level}, OFF=${s.main_relay_off_level})`
+        : '';
+      showToast((wheelsEnabled ? "Wheels enabled" : "Wheels disabled (relay OFF)") + relayInfo);
+    })
+    .catch(() => showToast("⚠ Wheels toggle failed", true));
+}
+
+function toggleAppInput() {
+  const next = appInputEnabled ? 0 : 1;
+  fetch(`/set_app_input?enabled=${next}`)
+    .then(r => r.json())
+    .then(s => {
+      appInputEnabled = !!s.app_input_enabled;
+      renderModeButtons();
+      showToast(appInputEnabled ? "App detection input enabled" : "App detection input disabled");
+    })
+    .catch(() => showToast("⚠ App input toggle failed", true));
+}
+
+// ── Servo UI ─────────────────────────────────────────────────
+function buildServoUI() {
+  const grid = document.getElementById('servoGrid');
+  grid.innerHTML = '';
+  joints.forEach(j => {
+    const card = document.createElement('div');
+    card.className = `card ${j.isGripper ? 'gripper-card' : ''}`;
+    card.innerHTML = `
+      <div class="card-header">
+        <div class="joint-label">
+          <div class="joint-icon">${j.icon}</div>
+          <div>
+            <div class="joint-name">${j.name}</div>
+            <div class="joint-sub">${j.sub}</div>
+          </div>
+        </div>
+        <div class="angle-display" id="disp${j.id}">${j.val}°</div>
+      </div>
+      <div class="limit-row">
+        <span class="limit-badge badge-min">MIN ${j.min}°</span>
+        <span class="limit-badge badge-max">MAX ${j.max}°</span>
+        <span class="limit-badge badge-home">HOME ${j.home}°</span>
+      </div>
+      <input type="range" id="sl${j.id}" min="${j.min}" max="${j.max}" value="${j.val}"
+        oninput="onSlide(${j.id}, this.value)"
+        onchange="sendAngle(${j.id}, this.value)">
+      <div class="range-labels"><span>${j.min}°</span><span>${j.max}°</span></div>
+      <div class="btn-row">
+        <button class="btn" onclick="nudge(${j.id}, -10)">−10°</button>
+        <button class="btn" onclick="nudge(${j.id},  -1)">− 1°</button>
+        <button class="btn" onclick="centerJoint(${j.id})">CTR</button>
+        <button class="btn" onclick="nudge(${j.id},  +1)">+ 1°</button>
+        <button class="btn" onclick="nudge(${j.id}, +10)">+10°</button>
+      </div>
+    `;
+    grid.appendChild(card);
+  });
+}
+
+// ── Preset UI ────────────────────────────────────────────────
+function buildPresetUI() {
+  const grid = document.getElementById('presetGrid');
+  grid.innerHTML = '';
+  presets.forEach(p => {
+    const isPickup = p.name.startsWith('pickup');
+    const card = document.createElement('div');
+    card.className = `preset-card ${isPickup ? 'pickup' : 'drop'}`;
+    card.id = `preset-card-${p.id}`;
+    card.innerHTML = `
+      <div class="preset-title">${p.label}</div>
+      <div class="preset-angles" id="preset-angles-${p.id}">${formatAngles(p.angles)}</div>
+      <div class="preset-btn-row">
+        <button class="preset-btn" onclick="gotoPreset(${p.id})">▶ Go To</button>
+        <button class="preset-btn save-btn" onclick="savePreset(${p.id})">💾 Save Current</button>
+      </div>
+    `;
+    grid.appendChild(card);
+  });
+}
+
+function formatAngles(angles) {
+  const names = ['Base', 'Shoulder', 'Elbow', 'Wrist', 'Gripper'];
+  return names.map((n, i) => `${n}: ${angles[i]}°`).join(' &nbsp;|&nbsp; ');
+}
+
+// Go to a preset position
+function gotoPreset(pid) {
+  fetch(`/goto_preset?id=${pid}`)
+    .then(() => showToast(`Moving to ${presets[pid].label}...`))
+    .catch(() => showToast('⚠ Connection error', true));
+}
+
+// Save current slider positions as preset (temporary — shown on UI only)
+// To permanently save: note the values and update firmware
+function savePreset(pid) {
+  const angles = joints.map(j => j.val);
+  presets[pid].angles = angles;
+
+  // Update display
+  document.getElementById(`preset-angles-${pid}`).innerHTML = formatAngles(angles);
+
+  // Flash card
+  const card = document.getElementById(`preset-card-${pid}`);
+  card.classList.add('saved-flash');
+  setTimeout(() => card.classList.remove('saved-flash'), 900);
+
+  // Send to firmware so it can use it immediately for sequences
+  fetch(`/save_preset?id=${pid}&a0=${angles[0]}&a1=${angles[1]}&a2=${angles[2]}&a3=${angles[3]}&a4=${angles[4]}`)
+    .then(() => showToast(`Saved! ${presets[pid].label} = [${angles.join(', ')}]`))
+    .catch(() => showToast('⚠ Save failed', true));
+}
+
+// ── Pick & Drop ──────────────────────────────────────────────
+function runPickDrop(obj) {
+  fetch(`/pickdrop?obj=${obj}`)
+    .then(r => r.text())
+    .then(t => {
+      if (t === 'OK') {
+        setSeqRunning(true);
+        showToast(`Sequence started: ${obj === 0 ? 'Paper' : 'Plastic'}`);
+      } else {
+        showToast('⚠ ' + t, true);
+      }
+    })
+    .catch(() => showToast('⚠ Connection error', true));
+}
+
+function stopSeq() {
+  fetch('/stop_seq')
+    .then(() => {
+      setSeqRunning(false);
+      showToast('Sequence stopped');
+    });
+}
+
+function setSeqRunning(running) {
+  document.getElementById('btnObj1').disabled = running;
+  document.getElementById('btnObj2').disabled = running;
+  const status = document.getElementById('seqStatus');
+  if (running) {
+    status.textContent = '▶ RUNNING — Sequence in progress...';
+    status.className = 'seq-status running';
+  } else {
+    status.textContent = 'IDLE — Ready';
+    status.className = 'seq-status';
+  }
+}
+
+function pollSeqStatus() {
+  fetch('/status')
+    .then(r => r.json())
+    .then(s => {
+      if (typeof s.wheels_enabled === "boolean") wheelsEnabled = s.wheels_enabled;
+      if (typeof s.app_input_enabled === "boolean") appInputEnabled = s.app_input_enabled;
+      renderModeButtons();
+      if (!s.busy) setSeqRunning(false);
+      document.getElementById('seqStatus').textContent =
+        s.busy ? ('▶ ' + s.task) : 'IDLE — Ready';
+      // Update slider displays from live angles (don't interrupt active drags)
+      s.angles.forEach((a, i) => {
+        const sl = document.getElementById('sl' + i);
+        const dp = document.getElementById('disp' + i);
+        if (sl && !sl.matches(':active')) { sl.value = a; joints[i].val = a; }
+        if (dp && !sl.matches(':active')) { dp.textContent = a + '°'; }
+      });
+    })
+    .catch(() => {});
+}
+
+// ── Servo controls ───────────────────────────────────────────
+function onSlide(id, val) {
+  document.getElementById(`disp${id}`).textContent = val + '°';
+}
+function sendAngle(id, val) {
+  val = parseInt(val);
+  const j = joints[id];
+  val = Math.min(j.max, Math.max(j.min, val));
+  j.val = val;
+  fetch(`/set?ch=${id}&angle=${val}`)
+    .then(r => r.text())
+    .then(() => showToast(`${j.name} → ${val}°`))
+    .catch(() => showToast('⚠ Connection error', true));
+}
+function nudge(id, delta) {
+  const j = joints[id];
+  const newVal = Math.min(j.max, Math.max(j.min, j.val + delta));
+  document.getElementById(`sl${id}`).value = newVal;
+  onSlide(id, newVal);
+  sendAngle(id, newVal);
+}
+function centerJoint(id) {
+  const j = joints[id];
+  const mid = Math.floor((j.min + j.max) / 2);
+  document.getElementById(`sl${id}`).value = mid;
+  onSlide(id, mid);
+  sendAngle(id, mid);
+}
+function homeAll() {
+  fetch('/home').then(() => {
+    joints.forEach(j => {
+      document.getElementById(`sl${j.id}`).value = j.home;
+      onSlide(j.id, j.home);
+      j.val = j.home;
+    });
+    showToast('All joints → Home');
+  });
+}
+function setGripper(mode) {
+  const g = joints[joints.length - 1];
+  // Keep button behavior aligned with firmware intent even when open > close.
+  const GRIPPER_OPEN_ANGLE = 170;
+  const GRIPPER_CLOSE_ANGLE = 90;
+  const desired = (mode === 'min') ? GRIPPER_OPEN_ANGLE : GRIPPER_CLOSE_ANGLE;
+  const angle = Math.min(g.max, Math.max(g.min, desired));
+  document.getElementById(`sl${g.id}`).value = angle;
+  onSlide(g.id, angle);
+  sendAngle(g.id, angle);
+}
+
+// Toast
+let toastTimer;
+function showToast(msg, isErr = false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.borderColor = isErr ? '#ef4444' : 'var(--accent)';
+  t.style.color       = isErr ? '#ef4444' : 'var(--accent)';
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+}
+</script>
+</body>
+</html>
+)=====";
+
+// ── Setup ─────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+
+  // Wheel relay outputs
+  pinMode(RA1, OUTPUT);
+  pinMode(RA2, OUTPUT);
+  pinMode(RB1, OUTPUT);
+  pinMode(RB2, OUTPUT);
+  pinMode(MAIN_RELAY, OUTPUT);
+
+  // Ultrasonic pins
+  pinMode(LEFT_TRIG, OUTPUT);
+  pinMode(LEFT_ECHO, INPUT);
+  pinMode(RIGHT_TRIG, OUTPUT);
+  pinMode(RIGHT_ECHO, INPUT);
+
+  // Boot defaults requested by user
+  setWheelsEnabled(false);       // Wheels OFF by default (forces relay OFF level)
+  setAppInputEnabled(true);      // App detection ON by default
+
+  // Optional: keep PWM outputs disabled during boot init to reduce startup twitch.
+  if (PCA_OE_PIN >= 0) {
+    pinMode(PCA_OE_PIN, OUTPUT);
+    setPcaOutputsEnabled(false); // disable outputs (OE HIGH)
+    Serial.printf("[INIT] PCA outputs disabled on OE pin GPIO %d\n", PCA_OE_PIN);
+  }
+
+  Wire.begin(PCA_SDA_PIN, PCA_SCL_PIN);
+  pca.begin();
+  pca.setOscillatorFrequency(OSC_FREQ);
+  pca.setPWMFreq(PWM_FREQ_HZ);
+  delay(10);
+
+  // IMPORTANT:
+  // Do NOT force servos to 0° on boot. Sync directly to startup angles.
+  Serial.println("\n[INIT] Syncing servos directly to startup angles...");
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    int a = clampAngle(i, startupAngles[i]);
+    writeServoNow(i, a);
+    targetAngles[i] = a;
+  }
+  delay(120);
+
+  // Re-enable PWM outputs only after valid targets are already loaded.
+  if (PCA_OE_PIN >= 0) {
+    delay(PCA_OUTPUT_ENABLE_DELAY_MS);
+    setPcaOutputsEnabled(true); // enable outputs (OE LOW)
+    Serial.println("[INIT] PCA outputs enabled.");
+  }
+
+  Serial.println("[INIT] Ready.");
+
+  // Network init (friend-style): AP always ON + optional STA
+  Serial.println("\n[NET] Initializing WiFi...");
+  if (ENABLE_STA) {
+    WiFi.mode(WIFI_AP_STA);
+    Serial.println("[NET] Mode: AP + STA");
+  } else {
+    WiFi.mode(WIFI_AP);
+    Serial.println("[NET] Mode: AP only");
+  }
+
+  WiFi.softAPConfig(AP_LOCAL_IP, AP_GATEWAY, AP_SUBNET);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.printf("[NET] AP SSID: %s\n", AP_SSID);
+  Serial.printf("[NET] AP IP  : %s\n", WiFi.softAPIP().toString().c_str());
+
+  if (ENABLE_STA) {
+    Serial.printf("[NET] STA connecting to %s", STA_SSID);
+    WiFi.begin(STA_SSID, STA_PASSWORD);
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("\n[NET] STA connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+      Serial.println("\n[NET] STA connect timeout. AP mode still active.");
+    }
+  }
+
+  // ── HTTP Routes ───────────────────────────────────────────
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send_P(200, "text/html", HTML_PAGE);
+  });
+
+  server.on("/config", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send(200, "application/json", buildConfigJson());
+  });
+
+  // /status — lightweight poll: live angles + busy + step label
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send(200, "application/json", buildStatusJson());
+  });
+
+  // /set_wheels?enabled=0|1
+  server.on("/set_wheels", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!req->hasParam("enabled")) {
+      req->send(400, "application/json", "{\"error\":\"Missing enabled param\"}");
+      return;
+    }
+    int e = req->getParam("enabled")->value().toInt();
+    setWheelsEnabled(e == 1);
+
+    String json = "{";
+    json += "\"ok\":true,";
+    json += "\"wheels_enabled\":" + String(wheelsEnabled ? "true" : "false") + ",";
+    json += "\"main_relay_pin\":" + String(MAIN_RELAY) + ",";
+    json += "\"main_relay_level\":" + String(digitalRead(MAIN_RELAY)) + ",";
+    json += "\"main_relay_on_level\":" + String(MAIN_RELAY_ACTIVE_LEVEL) + ",";
+    json += "\"main_relay_off_level\":" + String(MAIN_RELAY_INACTIVE_LEVEL);
+    json += "}";
+    req->send(200, "application/json", json);
+  });
+
+  // /set_app_input?enabled=0|1
+  server.on("/set_app_input", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!req->hasParam("enabled")) {
+      req->send(400, "application/json", "{\"error\":\"Missing enabled param\"}");
+      return;
+    }
+    int e = req->getParam("enabled")->value().toInt();
+    setAppInputEnabled(e == 1);
+    String json = "{";
+    json += "\"ok\":true,";
+    json += "\"app_input_enabled\":" + String(appInputEnabled ? "true" : "false");
+    json += "}";
+    req->send(200, "application/json", json);
+  });
+
+  // /ping — app-side health check
+  server.on("/ping", HTTP_GET, [](AsyncWebServerRequest* req) {
+    String json = "{";
+    json += "\"status\":\"pong\",";
+    json += "\"device\":\"RoboticArm_ESP32\",";
+    json += "\"busy\":" + String(seqRunning ? "true" : "false") + ",";
+    json += "\"wheels_enabled\":" + String(wheelsEnabled ? "true" : "false") + ",";
+    json += "\"app_input_enabled\":" + String(appInputEnabled ? "true" : "false") + ",";
+    json += "\"ap_ssid\":\"" + String(AP_SSID) + "\",";
+    json += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
+    json += "\"ap_clients\":" + String(WiFi.softAPgetStationNum()) + ",";
+    bool staConnected = (WiFi.status() == WL_CONNECTED);
+    json += "\"sta_connected\":" + String(staConnected ? "true" : "false") + ",";
+    json += "\"sta_ip\":\"" + WiFi.localIP().toString() + "\",";
+    json += "\"uptime_s\":" + String(millis() / 1000);
+    json += "}";
+    req->send(200, "application/json", json);
+  });
+
+  // /update (POST JSON) — trigger sequence from app detection
+  // Accepts:
+  //   {"bin_type":0}   => paper
+  //   {"bin_type":1}   => plastic
+  // Also accepts fallback string fields like status/type/label/material.
+  server.on("/update", HTTP_POST,
+    [](AsyncWebServerRequest* req) {
+      if (req->contentLength() == 0) {
+        req->send(400, "application/json", "{\"error\":\"Missing request body\"}");
+      }
+    },
+    NULL,
+    [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index, size_t total) {
+      if (index == 0) {
+        req->_tempObject = new String();
+        ((String*)req->_tempObject)->reserve(total);
+      }
+
+      String* body = (String*)req->_tempObject;
+      body->concat((const char*)data, len);
+
+      if (index + len != total) return; // wait for full payload
+
+      String payload = *body;
+      delete body;
+      req->_tempObject = nullptr;
+
+      // Ignore duplicate app messages while sequence is active or in short re-arm window
+      if (seqRunning) {
+        req->send(200, "application/json",
+          "{\"accepted\":false,\"ignored\":true,\"reason\":\"busy\"}");
+        return;
+      }
+
+      if (!appInputEnabled) {
+        req->send(200, "application/json",
+          "{\"accepted\":false,\"ignored\":true,\"reason\":\"app_input_disabled\"}");
+        return;
+      }
+
+      if (millis() < rearmAfterMs) {
+        req->send(200, "application/json",
+          "{\"accepted\":false,\"ignored\":true,\"reason\":\"rearming\"}");
+        return;
+      }
+
+      int obj = resolveObjFromUpdatePayload(payload);
+      if (obj < 0) {
+        req->send(400, "application/json",
+          "{\"error\":\"Invalid payload. Use {bin_type:0|1} or include paper/plastic label\"}");
+        return;
+      }
+
+      if (!startManagedSequence(obj, "app")) {
+        req->send(200, "application/json",
+          "{\"accepted\":false,\"ignored\":true,\"reason\":\"busy\"}");
+        return;
+      }
+
+      String json = "{";
+      json += "\"accepted\":true,";
+      json += "\"queued\":\"" + String(objectName(obj)) + "\",";
+      json += "\"busy\":true";
+      json += "}";
+      req->send(200, "application/json", json);
+    }
+  );
+
+  server.on("/set", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (req->hasParam("ch") && req->hasParam("angle")) {
+      int ch    = req->getParam("ch")->value().toInt();
+      int angle = req->getParam("angle")->value().toInt();
+      if (ch >= 0 && ch < NUM_SERVOS) {
+        setServoAngle(ch, angle);
+        req->send(200, "text/plain", "OK");
+        return;
+      }
+    }
+    req->send(400, "text/plain", "Bad Request");
+  });
+
+  server.on("/home", HTTP_GET, [](AsyncWebServerRequest* req) {
+    moveAllHome();
+    req->send(200, "text/plain", "OK");
+  });
+
+  server.on("/angles", HTTP_GET, [](AsyncWebServerRequest* req) {
+    String json = "{";
+    for (int i = 0; i < NUM_SERVOS; i++) {
+      json += "\"" + String(servos[i].name) + "\":" + String(currentAngles[i]);
+      if (i < NUM_SERVOS - 1) json += ",";
+    }
+    json += "}";
+    req->send(200, "application/json", json);
+  });
+
+  // /goto_preset?id=0 — move arm to a preset position
+  server.on("/goto_preset", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (req->hasParam("id")) {
+      int id = req->getParam("id")->value().toInt();
+      if (id >= 0 && id < 4) {
+        setAllAngles(presets[id].angles);
+        Serial.printf("[PRESET] Moving to %s\n", presets[id].label);
+        req->send(200, "text/plain", "OK");
+        return;
+      }
+    }
+    req->send(400, "text/plain", "Bad Request");
+  });
+
+  // /save_preset?id=0&a0=45&a1=130&a2=60&a3=90&a4=0
+  // Saves a preset in RAM (survives session, not power cycle — hard-code after calibration)
+  server.on("/save_preset", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (req->hasParam("id")) {
+      int id = req->getParam("id")->value().toInt();
+      if (id >= 0 && id < 4) {
+        int a[NUM_SERVOS];
+        bool ok = true;
+        const char* keys[] = { "a0","a1","a2","a3","a4" };
+        for (int i = 0; i < NUM_SERVOS; i++) {
+          if (req->hasParam(keys[i])) {
+            a[i] = clampAngle(i, req->getParam(keys[i])->value().toInt());
+          } else { ok = false; break; }
+        }
+        if (ok) {
+          for (int i = 0; i < NUM_SERVOS; i++) presets[id].angles[i] = a[i];
+          Serial.printf("[PRESET] Saved preset %d: [%d,%d,%d,%d,%d]\n",
+                        id, a[0], a[1], a[2], a[3], a[4]);
+          req->send(200, "text/plain", "OK");
+          return;
+        }
+      }
+    }
+    req->send(400, "text/plain", "Bad Request");
+  });
+
+  // /pickdrop?obj=0  (0 = paper, 1 = plastic)
+  server.on("/pickdrop", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (seqRunning) {
+      req->send(200, "text/plain", "Already running");
+      return;
+    }
+    if (req->hasParam("obj")) {
+      int obj = req->getParam("obj")->value().toInt();
+      if (obj == 0 || obj == 1) {
+        startManagedSequence(obj, "manual");
+        req->send(200, "text/plain", "OK");
+        return;
+      }
+    }
+    req->send(400, "text/plain", "Bad Request");
+  });
+
+  // /stop_seq — emergency stop
+  server.on("/stop_seq", HTTP_GET, [](AsyncWebServerRequest* req) {
+    seqRunning = false;
+    seqStep    = 0;
+    seqWaiting = false;
+    autoResumeWheelsAfterSeq = false;
+    rearmAfterMs = 0; // allow immediate next command after manual stop
+    // Halt all servos at current position
+    for (int i = 0; i < NUM_SERVOS; i++) targetAngles[i] = currentAngles[i];
+    Serial.println("[SEQ] STOPPED by user");
+    req->send(200, "text/plain", "OK");
+  });
+
+  server.begin();
+  Serial.println("Web server started.");
+  lastStepMs = millis();
+}
+
+void loop() {
+  updateServos();
+  runSequence();
+  runObstacleAvoidance();
+}
+
